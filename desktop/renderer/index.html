@@ -1,0 +1,98 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>bubble</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: transparent;
+    height: 100%;
+    overflow: hidden;
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+  }
+
+  .panel {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    border-radius: 14px;
+    background: rgba(30, 30, 34, 0.86);
+    color: #eee;
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.35);
+    overflow: hidden;
+  }
+
+  .header {
+    -webkit-app-region: drag;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 12px;
+    background: rgba(255, 255, 255, 0.06);
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+  }
+
+  .header button {
+    -webkit-app-region: no-drag;
+    background: rgba(255, 255, 255, 0.12);
+    border: none;
+    color: #eee;
+    width: 20px;
+    height: 20px;
+    border-radius: 5px;
+    font-size: 13px;
+    line-height: 1;
+    cursor: pointer;
+  }
+
+  .header button:hover {
+    background: rgba(255, 255, 255, 0.22);
+  }
+
+  .body {
+    flex: 1;
+    padding: 16px;
+    font-size: 13px;
+    color: #aaa;
+  }
+
+  .body p {
+    margin: 0 0 8px;
+  }
+
+  .versions {
+    margin-top: 16px;
+    font-size: 11px;
+    color: #777;
+    font-family: ui-monospace, monospace;
+  }
+</style>
+</head>
+<body>
+  <div class="panel">
+    <div class="header">
+      <span>bubble</span>
+      <button id="hide-btn" title="Hide (⌘⇧C to show again)">×</button>
+    </div>
+    <div class="body">
+      <p>Placeholder panel. No chat UI yet.</p>
+      <p>Drag this header to move the window. Press ⌘⇧C to toggle it.</p>
+      <div class="versions" id="versions"></div>
+    </div>
+  </div>
+
+  <script>
+    document.getElementById("hide-btn").addEventListener("click", () => {
+      window.bubble.hide();
+    });
+
+    const v = window.bubble.versions;
+    document.getElementById("versions").textContent =
+      `electron ${v.electron} · chrome ${v.chrome} · node ${v.node}`;
+  </script>
+</body>
+</html>

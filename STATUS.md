@@ -49,6 +49,7 @@ script as planned.
 - [ ] Frameless transparent window, 380x560
 - [ ] Stays on top when switching apps
 - [ ] Stays visible when another app goes fullscreen
+- [ ] Note whether macOS shows a Local Network privacy prompt
 - [ ] Header drags the window; buttons inside it still click
 - [ ] Cmd+Shift+C toggles visibility
 - [ ] Quits cleanly
@@ -58,20 +59,21 @@ script as planned.
 ## Phase 2 — Local server
 
 - [ ] `ws` server on 127.0.0.1:8787, not 0.0.0.0
-- [ ] Origin check rejects non-claude.ai, non-extension origins
+- [ ] Origin **allowlist**: accept only `https://claude.ai` and
+      `chrome-extension://*`, reject everything else including `null`
 - [ ] Pairing token generated, stored, required on connect
 - [ ] Full protocol from SPEC.md §4 implemented
-- [ ] One connection per role, ROLE_TAKEN on a second
+- [ ] One extension connection; ROLE_TAKEN on a second (claude.ai in two tabs)
 - [ ] JSON persistence on turn.end and turn.snapshot only
 - [ ] turn.snapshot replaces rather than appends
-- [ ] Two test clients relay messages between each other
+- [ ] One test client as the extension; messages reach the renderer over IPC
 
 ---
 
 ## Phase 3 — Bubble UI
 
 - [ ] Existing React component rendering in the Electron window
-- [ ] IPC bridge; renderer never touches the socket
+- [ ] IPC bridge; renderer never opens a WebSocket (see SPEC.md §4 note)
 - [ ] History renders on start
 - [ ] Deltas render progressively
 - [ ] Optimistic send with promptId reconciliation, no duplicates

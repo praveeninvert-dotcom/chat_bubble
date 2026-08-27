@@ -2,8 +2,9 @@
   "name": "desktop",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "main.js",
   "scripts": {
+    "start": "electron .",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -12,5 +13,8 @@
   "type": "commonjs",
   "dependencies": {
     "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0"
   }
 }
