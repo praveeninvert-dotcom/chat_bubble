@@ -1,81 +1,113 @@
 # STATUS.md
 
-Update this at the end of every working session. Claude Code reads it to find
-out where things stand.
+Update this at the end of every working session.
 
-**Current phase:** 0 — DOM feasibility not yet tested. Phase 1 (Worker) underway.
-**Last updated:** SPEC.md brought to v2.1 and Worker scaffolded (Prompt 2) — see Phase 1 below.
+**Current phase:** 0 COMPLETE. Nothing is blocked.
+**Architecture:** v3, local only. See SPEC.md §10.
+**Last updated:** pivot from Cloudflare relay to local Electron app
 
 ---
 
-## Phase 0 — Prove injection works
+## Superseded
 
-No code. Browser console only. Everything downstream depends on this.
+The Cloudflare Worker in `worker/` was built and verified: SQLite-backed Durable
+Object, hibernation API, room validation, echo round-trip, and a working test
+client. It is no longer part of the design. Kept in the repo in case remote
+access is ever wanted. Do not build on it.
 
-- [ ] D1 run, composer selector recorded in SELECTORS.md
-- [ ] D2 or D2b run, text successfully inserted into the composer
-- [ ] Send button confirmed to activate after injection
-- [ ] D3 run, send/stop button state change identified
-- [ ] D4 and D5 run, message and container selectors recorded
-- [ ] D6 run, code block formatting behaviour recorded
+---
+
+## Phase 0 — Feasibility
+
+- [x] 0a — **DONE 2026-08-27.** `ws://localhost` from claude.ai works. Gated by
+      Chrome Local Network Access permission (Chrome 142+), granted for
+      claude.ai. Full round trip confirmed against a local `ws` server. Origin
+      header is exactly `https://claude.ai`.
+- [x] Test 1 — **injection works.** `execCommand('insertText')` places text and
+      enables the send button. TipTap accepted it.
+- [x] Test 2 — container is `[data-testid="transcript-list"]`, rows are
+      `[data-testid="transcript-row"]`, role is `data-perf-row`
+- [x] Test 3 — **completion signal found.** `data-perf-row-streaming` flips to
+      `"false"` per turn. Better than the send-button approach.
+- [x] Test 4 — `innerText` preserves code indentation. Fences must be rebuilt
+      from `<pre>`; a11y prefix and trailing timestamp must be stripped.
 
 **Exit criterion:** text can be placed in the composer programmatically and
-submitted, and a complete assistant reply can be read back.
+submitted, a complete assistant reply can be read back, and the browser permits a
+localhost socket.
 
-**If this phase fails:** the project does not work as designed. Stop and
-reconsider before building anything.
-
----
-
-## Phase 1 — Relay
-
-- [ ] Cloudflare account created, `wrangler` installed and logged in (installed locally; no account/login needed until deploy)
-- [x] Worker scaffolded with a SQLite-backed Durable Object
-- [x] WebSocket upgrade handled, room routing works (validated: bad room/role → 400, good request → 101, verified against a running local instance)
-- [ ] Protocol from SPEC.md §4 implemented, including `conversation` and `turn.snapshot`
-- [ ] History persisted on `turn.end` only
-- [ ] Tested locally with two terminal clients — one as extension, one as bubble
-- [ ] Deployed to `*.workers.dev`, tested against the deployed URL
+**Result: passed.** Injection works, the completion signal is better than
+specified, and formatting survives. No blockers remain.
+**Localhost transport:** confirmed working. The socket stays in the content
+script as planned.
 
 ---
 
-## Phase 2 — Bubble
+## Phase 1 — Electron shell
 
-- [ ] Direct API call removed
-- [ ] WebSocket client wired in
-- [ ] History renders on connect
-- [ ] Streaming deltas render progressively
-- [ ] Optimistic send with `promptId` reconciliation
-- [ ] Connection state visible: connected / extension offline / disconnected
-- [ ] Tested against the deployed Worker using a fake extension client
+- [ ] Electron installed, app launches
+- [ ] Frameless transparent window, 380x560
+- [ ] Stays on top when switching apps
+- [ ] Stays visible when another app goes fullscreen
+- [ ] Header drags the window; buttons inside it still click
+- [ ] Cmd+Shift+C toggles visibility
+- [ ] Quits cleanly
 
 ---
 
-## Phase 3 — Extension
+## Phase 2 — Local server
 
-Blocked until Phase 0 is complete.
+- [ ] `ws` server on 127.0.0.1:8787, not 0.0.0.0
+- [ ] Origin check rejects non-claude.ai, non-extension origins
+- [ ] Pairing token generated, stored, required on connect
+- [ ] Full protocol from SPEC.md §4 implemented
+- [ ] One connection per role, ROLE_TAKEN on a second
+- [ ] JSON persistence on turn.end and turn.snapshot only
+- [ ] turn.snapshot replaces rather than appends
+- [ ] Two test clients relay messages between each other
 
-- [ ] `manifest.json` written, extension loads unpacked without errors
-- [ ] Room secret generated and stored, popup displays it
-- [ ] Content script connects to the Worker
-- [ ] Backfill of already-rendered turns on attach (`turn.snapshot`)
+---
+
+## Phase 3 — Bubble UI
+
+- [ ] Existing React component rendering in the Electron window
+- [ ] IPC bridge; renderer never touches the socket
+- [ ] History renders on start
+- [ ] Deltas render progressively
+- [ ] Optimistic send with promptId reconciliation, no duplicates
+- [ ] Three health states visible
+- [ ] Settings panel with token copy and regenerate
+
+---
+
+## Phase 4 — Extension
+
+Unblocked — Phase 0 passed 2026-08-27.
+
+- [ ] manifest.json, loads unpacked without errors
+- [ ] Options page accepts the pairing token
+- [ ] Content script connects to the local server
+- [ ] Backfill of already-rendered turns
 - [ ] MutationObserver captures user turns
-- [ ] Assistant turns captured with deltas and a correct `turn.end`
+- [ ] Assistant turns captured with deltas and a correct turn.end
 - [ ] Markdown reconstruction from message DOM
-- [ ] Prompt injection and submit working from a relayed message
-- [ ] `origin` and `promptId` tagging correct — no duplicate messages
-- [ ] SPA navigation detected, `conversation` message sent, bubble re-renders
-- [ ] `capture` health reported, and a broken selector shows in the bubble
+- [ ] Injection and submit working from a relayed prompt
+- [ ] origin and promptId tagging correct, no duplicates
+- [ ] SPA navigation detected, conversation message sent
+- [ ] claude.ai/new handled
+- [ ] capture health reported and visible in the bubble
 
 ---
 
-## Phase 4 — End to end
+## Phase 5 — End to end
 
 - [ ] Type in the bubble, message appears in claude.ai and sends
-- [ ] Claude's reply streams into the bubble
+- [ ] Reply streams into the bubble
 - [ ] Type in claude.ai, message appears in the bubble
+- [ ] Switch to another app — bubble stays visible and usable
 - [ ] Close the claude.ai tab — bubble shows extension offline
-- [ ] Reopen the tab — bubble reconnects and history is intact
+- [ ] Reopen — reconnects, history intact
+- [ ] Quit and relaunch the desktop app — history survives
 - [ ] Run for a full working day without intervention
 
 ---
@@ -83,12 +115,16 @@ Blocked until Phase 0 is complete.
 ## Open questions
 
 - Does the send-button state change reliably signal completion during tool use?
-- Does the assistant message node carry its own streaming attribute? Check in D3.
-- Where does the existing React bubble component live? It is not in this repo yet.
-- How much Markdown reconstruction is needed before the bubble reads acceptably?
-- Where will the bubble be hosted, and is that page private?
+- Does the assistant message node carry its own streaming attribute? Check in
+  Test 3.
+- Should the bubble auto-launch at login?
+- What happens if the operator resets claude.ai site permissions? The Local
+  Network Access grant is lost and the extension must say so clearly.
+- What happens if claude.ai is open in two tabs at once? Two extension
+  connections, one rejected — is that the right behaviour?
 
-## Decisions still to make
+## Decisions made
 
-- Bubble host: localhost during development. Production host undecided.
-- History retention: 200 turns per room, subject to revision.
+- Local only, no remote access. Confirmed by operator.
+- Electron over Tauri.
+- Desktop app owns the pairing token.

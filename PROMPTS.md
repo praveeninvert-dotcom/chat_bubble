@@ -1,218 +1,180 @@
 # PROMPTS.md
 
-Copy these into Claude Code one at a time, in order. Do not skip ahead — each
-one assumes the previous is finished and verified.
+Copy these into Claude Code one at a time, in order. Each assumes the previous is
+finished and verified.
 
-Before the first one: open a terminal in VS Code, `cd` into this folder, and run
-`claude`.
+Open a terminal in VS Code, `cd` into this folder, run `claude`.
 
-A note on budget. On the Pro plan you get roughly 10–40 Claude Code prompts every
-five hours, shared with your claude.ai usage. Each prompt below will spend
-several of those on back-and-forth. Do one phase per sitting rather than trying
-to finish in a day.
+On the Pro plan you get roughly 10–40 Claude Code prompts every five hours,
+shared with your claude.ai usage. Each prompt below spends several on
+back-and-forth. One phase per sitting.
 
 ---
 
 ## Phase 0 — Browser console. No Claude Code.
 
-Open `SELECTORS.md` and work through D1 to D6. Fill in the recorded values table.
+Two things, both in claude.ai DevTools. Neither can be delegated: Claude Code
+runs in a terminal and cannot see a web page.
 
-This is the only phase that cannot be delegated. Claude Code runs in a terminal
-and cannot see a web page. If you paste it a guess about a selector, it will
-write code against that guess and the code will fail silently.
+**0a — Can Chrome open a localhost socket from claude.ai?**
 
-When the table has real values in it, tick the Phase 0 boxes in `STATUS.md` and
-move on.
+```js
+const ws = new WebSocket('ws://localhost:8787');
+ws.onerror = () => console.log('ERROR fired — read the red text above');
+ws.onopen  = () => console.log('opened');
+```
+
+Nothing is listening, so it fails. What matters is how. `ERR_CONNECTION_REFUSED`
+means Chrome allowed the attempt — the architecture works. "Mixed Content" means
+Chrome blocked it and the socket has to move into the background service worker.
+
+**0b — Fill in SELECTORS.md Tests 1 through 4.** Run them on a real conversation
+at `claude.ai/chat/<id>`, not on `/new`, with Grammarly and QuillBot disabled.
 
 ---
 
 ## Prompt 1 — Orientation
 
 ```
-Read CLAUDE.md, SPEC.md, SELECTORS.md, and STATUS.md in this repo. Do not write
-any code yet.
+Read CLAUDE.md, SPEC.md, SELECTORS.md, and STATUS.md. Do not write any code.
 
-Then tell me, in plain English:
+The architecture changed in SPEC.md v3: the Cloudflare Worker is gone, replaced
+by a local Electron app that is both the WebSocket server and the bubble UI.
+worker/ is dead code kept for reference.
 
-1. A three-sentence summary of what this system does, in your own words.
-2. Which of the three components you can build right now, and which are blocked,
-   and why.
-3. Any place where SPEC.md contradicts itself, is ambiguous, or asks for
-   something that will not work. Be specific — quote the section.
-4. Anything the spec assumes that you think is wrong.
+Tell me, in plain English:
+1. A three-sentence summary of the v3 system in your own words.
+2. What you can build now and what is blocked, and why.
+3. Anywhere SPEC.md contradicts itself or asks for something that will not work.
+   Quote the section.
+4. Anything the spec assumes that you think is wrong, especially about Electron
+   on macOS.
 
 If you disagree with a locked decision in CLAUDE.md, say so and explain, but do
 not change it.
 ```
 
-Read the answer carefully. If it says something you don't understand, ask it to
-explain that one point before moving on. This prompt exists to catch problems
-while they are still cheap.
-
 ---
 
-## Prompt 2 — Worker scaffold
+## Prompt 2 — Electron shell
 
 ```
-Set up the Cloudflare Worker in worker/. Nothing else yet.
+Create the Electron app in desktop/. Window only — no WebSocket server yet, no
+chat UI.
 
 Requirements:
-- A single Worker entry point at worker/src/index.js
-- One Durable Object class called SessionRoom
-- SQLite-backed storage. The wrangler migration MUST use new_sqlite_classes.
-  new_classes will not deploy on the Workers Free plan.
-- Use the WebSocket Hibernation API, not raw addEventListener on the socket.
-- The Worker accepts WebSocket upgrades at /ws?room=<roomKey>&role=<extension|bubble>
-- It validates that room is a 64-character hex string and role is one of the two
-  allowed values. Reject anything else with HTTP 400 and a clear reason.
-- It routes the socket into the SessionRoom instance named by roomKey.
-- No protocol logic yet. On receiving any message, just echo it back to the
-  sender with a [bubble-worker] log line.
+- Electron main process, preload script with contextIsolation, and a renderer
+  showing a placeholder panel
+- Frameless, transparent, resizable BrowserWindow, 380x560
+- setAlwaysOnTop(true, 'floating')
+- setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
+- A draggable header strip using -webkit-app-region: drag, with no-drag on any
+  button inside it
+- A global shortcut Cmd+Shift+C that toggles show/hide
+- Quit cleanly from the menu or Cmd+Q
 
-Before you start:
-- Tell me what wrangler is and what I will need to install.
-- Tell me whether I need a Cloudflare account and whether it costs anything.
-- List every command I will need to run and what each one does.
+Before you start, tell me what Electron is, what it installs, and roughly how
+large the install is.
 
-Then write the code, and give me the exact commands to run it locally and
-confirm it works.
+Then give me the exact commands to run it, and tell me what to look for: the
+window should stay visible when I switch to another app and when an app goes
+fullscreen.
 ```
 
-Expect to create a free Cloudflare account during this step.
+Test the fullscreen behaviour yourself. That is the requirement that made this a
+desktop app rather than a web page, and it is the one most likely to be subtly
+wrong.
 
 ---
 
-## Prompt 3 — Test client
+## Prompt 3 — Local server and protocol
 
 ```
-Write a small Node.js script at worker/test-client.js that connects to the
-Worker as a WebSocket client.
+Add the WebSocket server to the Electron main process in desktop/.
 
-It should:
-- Take the room key and role as command-line arguments
-- Connect, send a hello message, and print everything it receives, prefixed with
-  the role name
-- Let me type JSON messages into the terminal and send them
+Requirements:
+- ws package, listening on 127.0.0.1 port 8787. Never 0.0.0.0.
+- Reject any upgrade whose Origin header is not https://claude.ai or a
+  chrome-extension:// origin
+- Require a token query parameter matching a 32-byte token the app generates on
+  first run and stores in app.getPath('userData')
+- Implement the full protocol in SPEC.md section 4: hello, conversation,
+  turn.snapshot, prompt, turn.start, turn.delta, turn.end, status, and the
+  server-to-client history, peers, and error messages
+- One connection per role; reject a second with ROLE_TAKEN
+- Persist to a JSON file in userData on turn.end and turn.snapshot only, never
+  on turn.delta
+- turn.snapshot replaces stored turns for that conversation, it does not append
+- Drop unrecognised message types rather than forwarding them
+- Enforce a maximum message size
 
-Then write worker/test-room.js that prints a valid room key I can use for
-testing, generated the same way the extension will generate it (SHA-256 of a
-the secret alone, hex encoded (SHA-256 of the secret — see SPEC.md §5).
+Explain the JSON file structure before you write it.
 
-Give me the exact commands to open two terminals, connect one as extension and
-one as bubble, and confirm messages relay between them.
+Then write desktop/test-client.js: a Node script taking a role and token as
+arguments, connecting, printing everything it receives, and sending JSON I type.
+
+Give me commands to run two of them — one as extension, one as bubble — and
+confirm a message typed in one appears in the other. That cross-forwarding is
+the point of this prompt.
 ```
 
-Two terminal windows, two clients talking to each other. That is the relay
-proven, without any browser involved.
+Unlike the old Prompt 3, this one **should** relay between terminals. If it does
+not, the protocol is broken.
 
 ---
 
-## Prompt 4 — Protocol
+## Prompt 4 — Bubble UI
 
 ```
-Implement the message protocol from SPEC.md section 4 in the SessionRoom
-Durable Object.
+The bubble/ folder has a React chat component. Read it and tell me what it does
+before changing anything.
 
-Specifically:
-- Handle hello, prompt, turn.start, turn.delta, turn.end, and status
-- Send history to any client immediately after its hello
-- Send peers to all clients whenever a client connects or disconnects
-- Reject a second extension connection with an error message of code ROLE_TAKEN
-- Persist a turn to SQLite ONLY on turn.end. Never on turn.delta.
-- Keep at most 200 turns per room, deleting the oldest beyond that
-- Drop any message type not in the spec rather than forwarding it
-- Enforce a maximum message size and reject anything larger
+Wire it into the Electron renderer:
+- Renderer talks to the main process over contextBridge IPC. It never opens a
+  socket itself.
+- Render history on start; clear and re-render on a conversation change
+- Render assistant turns progressively as turn.delta arrives
+- Send prompts optimistically with a promptId, reconcile on promptId when the
+  matching turn returns. Never show a message twice.
+- Show three health states clearly: extension connected and capturing, extension
+  connected but capture broken, extension offline
+- A settings panel showing the pairing token with a copy button and a regenerate
+  action
 
-Explain the storage schema you chose before you write it.
-
-Then update test-client.js so I can exercise each message type easily, and walk
-me through a test that proves history persists after both clients disconnect and
-reconnect.
-```
-
----
-
-## Prompt 5 — Deploy
-
-```
-Deploy the Worker to Cloudflare and confirm it works from the deployed URL, not
-just locally.
-
-Before deploying:
-- Explain what will be publicly reachable on the internet once this is live
-- Confirm nothing sensitive is in any file that gets deployed
-- Show me the .gitignore and tell me if anything is missing
-
-After deploying, give me the commands to run the test clients against the
-deployed URL. Update STATUS.md.
-```
-
-Stop here and check `STATUS.md` says Phase 1 complete before continuing.
-
----
-
-## Prompt 6 — Bubble
-
-```
-The bubble/ folder contains an existing React chat component that currently
-calls the Anthropic API directly. Read it and tell me what it does before
-changing anything.
-
-Then replace the direct API call with a WebSocket client that speaks the
-protocol in SPEC.md section 4.
-
-It must:
-- Read the room secret from a local config file (no conversation ID — the
-  extension announces it) that is
-  gitignored
-- Render history on connect
-- Render assistant turns progressively as turn.delta messages arrive
-- Send prompts optimistically with a promptId, and reconcile on promptId when
-  the matching turn comes back — never show the same message twice
-- Show three distinct connection states in the UI: connected, relay up but
-  extension offline, and disconnected. I must never be left guessing whether it
-  is broken.
-- Reconnect automatically with backoff when the socket drops
-
-Do not add any other features. Test it against the deployed Worker using
-test-client.js acting as the extension.
+Test against desktop/test-client.js acting as the extension. Do not add any
+other features.
 ```
 
 ---
 
-## Prompt 7 — Extension. Only after Phase 0 is done.
+## Prompt 5 — Extension. Only after Phase 0 is complete.
 
 ```
 Read SELECTORS.md. If any value in the recorded values table still says UNKNOWN,
-stop and tell me which ones — do not write code against a guessed selector.
+stop and tell me which — do not write code against a guessed selector.
 
-If they are all filled in, build the Chrome extension in extension/:
+If they are filled in, build the Chrome extension in extension/:
+- manifest.json, MV3, permissions limited to storage and https://claude.ai/*
+- An options page where I paste the pairing token from the desktop app
+- The WebSocket lives in the content script, connecting to
+  ws://127.0.0.1:8787/?role=extension&token=<token>
+- Reconnect with backoff; the desktop app may not be running
+- Backfill already-rendered turns as turn.snapshot on attach
+- MutationObserver using only the selectors recorded in SELECTORS.md
+- Emit turn.start, turn.delta, turn.end using the recorded completion signal
+- Inject prompts with the recorded working technique, submit with the recorded
+  submit technique
+- Tag bubble-originated user turns with origin "bubble" and the matching promptId
+- Report capture health in the status message
+- Handle claude.ai/new, which has no conversation ID until the first message
 
-- manifest.json, MV3, permissions limited to storage and host access to
-  https://claude.ai/*
-- The WebSocket lives in the content script, not the background service worker
-- On load: read or generate a 32-byte random secret in chrome.storage.local,
-  read the conversation ID from the URL, compute the room key, connect
-- A popup that displays the secret so I can copy it into the bubble config
-- MutationObserver on the conversation container, using the selectors recorded
-  in SELECTORS.md and no others
-- Emit turn.start, turn.delta, and turn.end per the spec, using the recorded
-  completion signal
-- Handle incoming prompt messages by injecting text with the recorded working
-  technique and submitting with the recorded submit technique
-- Tag bubble-originated user turns with origin "bubble" and the matching
-  promptId
-
-Build it in that order and let me load and test after each piece. Tell me
-exactly how to load an unpacked extension in Chrome and how to see its console
-output.
+Build in that order and let me load and test after each piece. Tell me exactly
+how to load an unpacked extension in Chrome and how to see its console output.
 ```
 
 ---
 
 ## When something breaks
-
-Do not describe the symptom in your own words and ask for a fix. Instead:
 
 ```
 Something is broken. Here is exactly what I did, what I expected, and what
@@ -231,4 +193,4 @@ Do not guess at the cause. Tell me what to run next to narrow it down.
 ```
 
 The last line matters. Without it you get a plausible fix for the wrong problem,
-you apply it, something else changes, and now there are two bugs.
+you apply it, and now there are two bugs.

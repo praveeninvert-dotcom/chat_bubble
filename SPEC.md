@@ -1,222 +1,224 @@
 # SPEC.md — Claude session bubble
 
-Version 2.1. Supersedes the original project scope document, which contained
-six errors listed in §9. See §10 for what changed between v2 and v2.1.
+Version 3. Local-only architecture. Supersedes v2.1, which routed through a
+Cloudflare Worker. See §10 for what changed and why.
 
 ---
 
 ## 1. Goal
 
-One person can carry on a single claude.ai conversation from two surfaces at
-once: the real claude.ai tab, and a floating chat bubble embedded on a different
-website they control.
+One person can drive a single claude.ai conversation from a small always-on-top
+window that floats above whatever else they are doing on their Mac.
 
 Typing in the bubble puts the message into the real claude.ai composer and sends
-it. Claude's reply streams back into the bubble as it is generated. Messages
-typed directly into claude.ai also appear in the bubble.
+it. Claude's reply streams back into the bubble. Messages typed directly into
+claude.ai also appear in the bubble.
 
 ## 2. Non-goals
 
-- No sharing, no second user, no viewer page.
+- No access from a phone, a second machine, or anywhere off this device.
+- No sharing, no second user.
 - No public distribution. This is not a Chrome Web Store product.
 - No use of the Anthropic API and no API keys anywhere in the system.
-- No support for more than one active conversation at a time.
-
-The room itself is not scoped to a conversation — it is scoped to the
-operator's secret, for the lifetime of the extension install. Only one
-conversation is *mirrored* at a time; switching which claude.ai conversation is
-open replaces the room's active conversation and its stored turns, rather than
-opening a second room. See §4 and §5.
+- Nothing leaves the machine. No cloud component of any kind.
 
 ## 3. Components
+
+Two, not three. The desktop app is both the relay and the UI.
 
 ### 3.1 Chrome extension (MV3)
 
 Runs only on `https://claude.ai/*`.
 
-**Manifest permissions:** `storage` (for the room secret), and a host permission
+**Manifest permissions:** `storage` (for the pairing token) and a host permission
 for `https://claude.ai/*`. Nothing else. No `tabs`, no `<all_urls>`.
 
-**Content script** does all the work and holds the WebSocket, because MV3
-service workers are terminated when idle.
+**Content script** holds the WebSocket and does all DOM work.
 
 Responsibilities:
 
-1. Read the conversation ID from the URL (`https://claude.ai/chat/<uuid>`).
-2. Read or create the room secret in `chrome.storage.local`.
-3. Compute the room key (`SHA-256(secret)` — see §5) and open a WebSocket to
-   the Worker. The room key does not depend on the conversation ID.
-4. Observe the conversation container for new and changing message nodes. On
-   first attach, also read whatever turns are already rendered and send them
-   as one `turn.snapshot` — a `MutationObserver` never fires for nodes that
-   existed before it started observing, so without this the operator's
-   existing conversation would look empty until the next new turn.
-5. Emit `turn.start` / `turn.delta` / `turn.end` for each new turn.
-6. Receive `prompt` messages and inject them into the composer, then submit.
-7. Detect SPA navigation (the URL changes without a page reload). Send a
-   `conversation` message announcing the new conversation ID, then a fresh
-   `turn.snapshot` backfilling whatever is already rendered for it. Do **not**
-   recompute the room key — the room persists for the life of the install; only
-   which conversation it mirrors changes.
-8. Report capture health via the `capture` field on `status` (§4) whenever a
-   known selector fails to resolve, so the bubble can tell "extension offline"
-   apart from "extension running but its selectors broke."
+1. Read the pairing token from `chrome.storage.local`. If absent, do nothing and
+   report an unpaired state in the options page.
+2. Read the conversation ID from the URL (`https://claude.ai/chat/<id>`), or note
+   that there is none (`https://claude.ai/new`).
+3. Connect to `ws://127.0.0.1:8787/?role=extension&token=<token>`. Before
+   connecting, check `navigator.permissions.query({ name: 'local-network-access' })`.
+   If the state is not `granted`, show the operator a specific message about the
+   Local Network Access permission instead of reporting a generic connection
+   failure — the two look identical in the console and would waste an hour.
+4. On attach, **backfill**: read every message already rendered on the page and
+   send a `turn.snapshot`. A MutationObserver fires only on changes made after it
+   attaches, so existing turns are otherwise invisible.
+5. Observe the conversation container and emit `turn.start` / `turn.delta` /
+   `turn.end` for turns appearing after attach.
+6. Receive `prompt` messages, inject into the composer, submit.
+7. Detect SPA navigation and send a `conversation` message with the new ID.
+8. Handle the **unstarted-chat case**. `claude.ai/new` has no conversation ID.
+   Sending the first message transitions the URL to `/chat/<id>` without a page
+   reload. The extension must attach on `/new`, report a null conversation, and
+   emit a real `conversation` message once the ID appears. A prompt sent from the
+   bubble while on `/new` should start the conversation.
+9. Reconnect with backoff whenever the socket drops. The desktop app may not be
+   running.
 
-**Background service worker** exists only to serve the extension popup, which
-displays the room secret for the operator to copy. It holds no socket.
+**Options page** accepts the pairing token, pasted from the desktop app.
 
-### 3.2 Cloudflare Worker + Durable Object
+**Background service worker** is not used for the socket. It exists only if the
+options page needs it.
 
-**Worker:** accepts WebSocket upgrade requests at `/ws?room=<roomKey>&role=<role>`,
-validates the parameters, and forwards the socket into the Durable Object whose
-name is `roomKey`.
+### 3.2 Desktop app (Electron, macOS)
 
-**Durable Object:** one per room. Holds the connected sockets, keeps the last N
-completed turns in SQLite storage, and fans messages between the extension and
-the bubble.
+One app, two jobs.
 
-Uses the **WebSocket Hibernation API** so the object can be evicted between
-messages without dropping connections.
+**Job one — WebSocket server.** Listens on `127.0.0.1:8787` in the main process,
+using the `ws` package. Never binds `0.0.0.0`. Holds at most one `extension`
+connection and one `bubble` connection, routes messages between them per §4, and
+persists completed turns to a JSON file in `app.getPath('userData')`.
 
-**Constraints that shape the design:**
+**Job two — the bubble window.** A frameless, transparent, always-on-top
+`BrowserWindow` rendering the React bubble.
 
-- Free plan requires SQLite-backed DOs. Migration tag must use
-  `new_sqlite_classes`. `new_classes` will not deploy.
-- Free plan allows 100,000 row writes per day. Persist only completed turns.
-- Keep at most 200 turns per room; delete oldest beyond that.
+macOS window configuration that actually produces the behaviour wanted:
 
-### 3.3 Chat bubble
+```js
+const win = new BrowserWindow({
+  width: 380, height: 560,
+  frame: false, transparent: true, resizable: true,
+  alwaysOnTop: true, skipTaskbar: true,
+  webPreferences: { preload, contextIsolation: true, nodeIntegration: false }
+});
+win.setAlwaysOnTop(true, 'floating');
+win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+```
 
-An existing React component with drag and snap-to-edge behaviour. Currently
-calls the Anthropic API directly. That call gets replaced with a WebSocket
-client.
+`'floating'` is the level that keeps it above ordinary windows.
+`visibleOnFullScreen` is what makes it survive when another app goes fullscreen.
+Without both, the bubble disappears exactly when it is most wanted.
+
+Dragging uses `-webkit-app-region: drag` on the bubble's header strip, with
+`-webkit-app-region: no-drag` on every button inside it. Otherwise the buttons
+become drag handles and stop being clickable.
+
+A global shortcut (suggest `Cmd+Shift+C`) toggles show and hide.
+
+Renderer and main communicate over `contextBridge` IPC. The renderer never
+touches the socket directly.
+
+### 3.3 The bubble UI
+
+The existing React component, rendered inside the Electron window.
 
 Responsibilities:
 
-1. Read the room secret from local config. The room key is derived from the
-   secret alone (§5) — the bubble does not need to know the conversation ID in
-   advance. It learns which conversation is active from the server, via the
-   `conversationId` on `history` and later `conversation` messages.
-2. Open a WebSocket to the Worker with `role=bubble`.
-3. Render `history` on connect, including which conversation it belongs to.
-4. Render streaming turns progressively as deltas arrive.
-5. Send `prompt` messages, rendering them optimistically with a client-side ID.
-6. Show a clear connection state: connected / relay up but extension offline /
-   disconnected. The operator must never be left wondering whether it is broken.
+1. Render history received from the main process on start.
+2. Clear and re-render when a `conversation` message arrives with a new ID.
+3. Render assistant turns progressively as deltas arrive.
+4. Send prompts optimistically with a `promptId`, reconcile on `promptId` when
+   the matching turn returns — never show a message twice.
+5. Show a health state: extension connected and capturing / extension connected
+   but capture broken / extension offline. The operator must never be left
+   guessing whether it is broken.
 
 ---
 
 ## 4. Message protocol
 
-All messages are JSON objects with a `type` field. All are relayed verbatim by
-the Durable Object except where noted.
+JSON over WebSocket. Unchanged from v2.1 except that `room` no longer exists —
+there is one server and one pair of clients.
 
 ### Client to server
 
-**`hello`** — first message after connecting. Sent by both roles.
+**`hello`** — first message after connecting.
 ```json
 { "type": "hello", "role": "extension" | "bubble", "clientId": "<random>" }
 ```
-No `conversationId` here — the room key no longer depends on it (§5), so
-neither role needs to know it before connecting. Which conversation is active
-arrives separately, via `history` and `conversation` below.
 
-**`conversation`** — extension only. Announces the currently active
-conversation: once right after `hello`, and again every time SPA navigation
-moves the extension to a different conversation.
+**`conversation`** — extension only. Sent after `hello` and whenever the operator
+navigates to a different conversation. `conversationId` may be `null` on
+`claude.ai/new`.
 ```json
-{ "type": "conversation", "conversationId": "<uuid>", "ts": 1730000000 }
+{ "type": "conversation", "conversationId": "<id or null>", "title": "..." }
 ```
-The DO stores the latest value and includes it in `history` for any client
-that connects afterward.
+The server records this, forwards it to the bubble, and sends the bubble the
+stored history for that conversation.
 
-**`turn.snapshot`** — extension only. A full replacement of the room's turn
-history, built by reading whatever is currently rendered in the DOM. Sent on
-first attach to a conversation and again after every `conversation` message,
-since a `MutationObserver` cannot see nodes that existed before it attached.
+**`turn.snapshot`** — extension only. The full ordered set of turns currently
+rendered, sent on attach and after a conversation change. The server **replaces**
+its stored turns for that conversation rather than appending. The page is the
+source of truth, so replacing is always correct and cannot duplicate on
+reconnect.
 ```json
-{ "type": "turn.snapshot",
-  "turns": [ { "turnId": "...", "role": "user" | "assistant", "text": "...",
-  "ts": 0 } ] }
+{ "type": "turn.snapshot", "conversationId": "<id>",
+  "turns": [ { "role": "user" | "assistant", "text": "...", "seq": 0 } ] }
 ```
-Unlike `turn.end`, which appends one persisted turn, `turn.snapshot` replaces
-every stored turn in the room. It is not a delta.
 
-**`prompt`** — bubble to extension. The bubble generates `promptId`.
+**`prompt`** — bubble to extension.
 ```json
 { "type": "prompt", "promptId": "<random>", "text": "..." }
 ```
 
-**`turn.start`** — extension only. A new message node appeared.
+**`turn.start`** — extension only.
 ```json
 { "type": "turn.start", "turnId": "<random>", "role": "user" | "assistant",
-  "origin": "bubble" | "native", "promptId": "<id or null>", "ts": 1730000000 }
+  "origin": "bubble" | "native", "promptId": "<id or null>", "ts": 0 }
 ```
 
 **`turn.delta`** — extension only. Text appended to an in-progress turn.
 ```json
-{ "type": "turn.delta", "turnId": "<id>", "text": "chunk of new text" }
+{ "type": "turn.delta", "turnId": "<id>", "text": "chunk" }
 ```
 
-**`turn.end`** — extension only. Turn is complete. `text` is the full final
-text and is authoritative; it replaces whatever the deltas produced.
+**`turn.end`** — extension only. `text` is the full final text and is
+authoritative; it replaces whatever the deltas produced.
 ```json
 { "type": "turn.end", "turnId": "<id>", "text": "complete message text" }
 ```
 
-**`status`** — extension only. Heartbeat, generation state, and DOM capture
-health. `capture.ok: false` is how the bubble learns a selector broke — see
-the risk noted in §8 — rather than looking identically dead as when the
-extension itself is offline.
+**`status`** — extension only, every 20 seconds.
 ```json
-{ "type": "status", "streaming": true,
-  "capture": { "ok": true, "detail": null }, "ts": 1730000000 }
+{ "type": "status", "conversationId": "<id or null>", "streaming": true,
+  "capture": "ok" | "no-container" | "no-composer" }
 ```
-`conversationId` is not repeated here — it travels on `conversation` and
-`history` instead, so there is one place it can go stale, not two.
+
+`capture` matters more than it looks. The extension can be connected while its
+observer is attached to nothing, because a selector broke after an Anthropic
+frontend update. Without this field the bubble shows healthy and sits silent, and
+the operator debugs the server for an hour when the problem is a renamed
+attribute.
 
 ### Server to client
 
-**`history`** — sent to any client immediately after `hello`.
+**`history`** — sent after `hello` and after each `conversation` change.
 ```json
-{ "type": "history", "conversationId": "<uuid or null>",
-  "turns": [ { "turnId": "...", "role": "...", "text": "...", "ts": 0 } ] }
+{ "type": "history", "conversationId": "<id>", "turns": [] }
 ```
-`conversationId` is `null` only in the narrow window before the extension has
-ever sent a `conversation` message for this room (e.g. a bubble connects
-before the extension has attached to any conversation).
 
-**`peers`** — sent whenever a client connects or disconnects, so the bubble can
-show whether the extension is live.
+**`peers`** — sent whenever a client connects or disconnects.
 ```json
-{ "type": "peers", "extension": true, "bubbles": 1 }
+{ "type": "peers", "extension": true, "bubble": true }
 ```
 
 **`error`**
 ```json
-{ "type": "error", "code": "BAD_ROOM" | "ROLE_TAKEN" | "MALFORMED", "message": "..." }
+{ "type": "error", "code": "BAD_TOKEN" | "ROLE_TAKEN" | "MALFORMED", "message": "..." }
 ```
 
 ### Rules
 
-- Only one `extension` socket per room. A second one is rejected with `ROLE_TAKEN`.
-- The DO persists a turn only on `turn.end`, appending it to the room's stored turns.
-- The DO relays `turn.delta` without persisting it.
-- On `turn.snapshot`, the DO replaces every stored turn in the room with the
-  snapshot's turns. It does not merge or append.
-- On `conversation`, the DO stores the `conversationId` as the room's current
-  value and includes it in `history` for future connections.
-- Any message type the DO does not recognise is dropped, not forwarded.
+- One connection per role. A second is rejected with `ROLE_TAKEN`.
+- Persist only on `turn.end` and `turn.snapshot`. Never on `turn.delta`.
+- Unrecognised message types are dropped, not forwarded.
+- Maximum message size enforced; oversized messages rejected.
 
 ### Echo handling
 
 When the bubble sends a `prompt`, it renders that message immediately with its
-own `promptId`. The extension injects the text; claude.ai then renders it as a
-user turn, which the observer picks up. The extension must tag that turn with
+own `promptId`. The extension injects the text; claude.ai renders it as a user
+turn, which the observer picks up. The extension tags that turn with
 `origin: "bubble"` and the matching `promptId`.
 
-The bubble reconciles on `promptId` — it replaces its optimistic message rather
-than appending a second copy. Turns with `origin: "native"` are always appended.
+The bubble reconciles on `promptId` — replacing its optimistic message rather
+than appending a copy. Turns with `origin: "native"` are always appended.
 
 Deduplicating on message text instead would break the moment the operator
 legitimately sends the same text twice.
@@ -225,119 +227,127 @@ legitimately sends the same text twice.
 
 ## 5. Security model
 
-**Threat:** the Worker is a public internet endpoint. Anyone who learns a room
-key can read the conversation and inject prompts into a live authenticated
-Claude session.
+Local-only removes most of the previous threat surface. Nothing is exposed to the
+internet and no conversation content leaves the machine. Two exposures remain.
 
-**Room key derivation:**
-```
-secret     = 32 random bytes, generated once, stored in chrome.storage.local
-roomKey    = hex( SHA-256( secret ) )
-```
+**Any web page can open a socket to localhost.** A site open in another tab can
+attempt `ws://127.0.0.1:8787`. Three defences, all required:
 
-The conversation UUID is never part of the key — it is visible in the URL bar,
-browser history, sync, and any screenshot, so it must not contribute to a
-secret. It is also excluded for a second, independent reason: an earlier
-version of this design folded the conversation ID into the key, which meant
-navigating to a different claude.ai conversation silently pointed the
-extension at a brand-new, empty Durable Object while the bubble stayed
-connected to the old one — conversation switching just broke the connection.
-The key is now derived from the secret alone, so the room persists for the
-life of the extension install; which conversation it currently mirrors travels
-over the protocol instead, as a `conversation` message (§4).
+1. **Bind to `127.0.0.1` only.** Never `0.0.0.0`, which would expose the server
+   to the local network.
+2. **Origin check on upgrade.** Reject any connection whose `Origin` header is
+   exactly `https://claude.ai` (confirmed by test 2026-08-27) or the extension's
+   own `chrome-extension://` origin. A page cannot forge its origin.
+3. **Pairing token.** A 32-byte random value generated by the desktop app on
+   first run, stored in its userData directory, displayed in a settings panel,
+   and pasted by hand into the extension's options page. Rejected connections get
+   `BAD_TOKEN` and are closed.
 
-**The secret moves by hand.** The operator opens the extension popup, copies the
-secret, and pastes it into the bubble's local config. It is never transmitted.
+**Token rotation.** The settings panel exposes a regenerate action. Rotating
+invalidates the extension's stored token until it is re-pasted.
 
-**Nothing authenticating ever crosses the relay.** No cookies, no `sessionKey`,
+**Nothing authenticating ever crosses the socket.** No cookies, no `sessionKey`,
 no org ID, no bearer token. If any of those would need to travel, the design is
 wrong.
 
-**Bubble host page.** The secret is present in client-side JavaScript on
-whatever site hosts the bubble. That page must not be publicly reachable. A
-localhost page, a password-protected page, or a private deployment is required.
-
 ## 6. Streaming and completion detection
 
-Claude's replies stream. The assistant node is inserted nearly empty and then
-mutates continuously for several seconds. A naive "node added → read text" reads
-an empty node.
+Claude's replies stream. The assistant node is inserted nearly empty and mutates
+continuously for several seconds. A naive "node added → read text" reads an empty
+node.
 
-**Completion signal:** the composer's send button reverts from stop-state to
-send-state when generation finishes. Watch that, not the message node.
+**Completion signal — resolved.** `data-perf-row-streaming` on a
+`[data-testid="transcript-row"]` flips from `"true"` to `"false"` when that turn
+finishes generating. Confirmed 2026-08-27.
+
+This is per-turn rather than global, so it identifies *which* message completed.
+A pause during tool use cannot be misread as completion, which was the failure
+mode that made this section difficult. The send-button approach is no longer
+needed.
 
 **Why not debounce on mutation quiet:** Claude pauses mid-response during tool
-use — web search, code execution, file operations. A quiet-period heuristic
-would fire `turn.end` during the pause, then a second turn afterwards. The
-bubble would show a truncated answer followed by a fragment.
+use — web search, code execution. A quiet-period heuristic would fire `turn.end`
+during the pause, then a second turn afterwards, showing a truncated answer
+followed by a fragment.
 
-**Fallback:** if the button-state approach proves unworkable, use a long
-debounce (2500ms) and accept occasional split turns. Record the choice here.
+**Degraded mode** — a long debounce (2500ms) — remains documented only as a last
+resort if the attribute is ever removed. It carries the split-turn bug described
+above and should not be built unless forced.
 
-Status: **unverified.** Depends on SELECTORS.md.
+**Turn start** is detected from node insertion into the transcript list, not from
+the streaming attribute. A newly inserted row already carries
+`data-perf-row-streaming="true"`, and attribute observers do not fire for initial
+values on new nodes.
 
 ## 7. Text extraction
 
 `textContent` on a rendered assistant message destroys code block newlines and
-indentation, collapses tables, and flattens lists. The bubble would show
-undifferentiated paragraphs.
+indentation, collapses tables, and flattens lists.
 
-Approach: walk the message node and reconstruct Markdown — fenced blocks for
-`<pre>`, backticks for inline `<code>`, `-` for list items, `#` for headings.
-Treat this as real work, not a detail.
+**Confirmed 2026-08-27: `innerText` preserves code block newlines and
+indentation.** This section is much smaller than originally budgeted. Three
+cleanups are required rather than a full HTML-to-Markdown walk:
+
+1. Rebuild code fences. The language label appears as a bare text line with no
+   backticks. Find `<pre>` in the row and wrap its content, using the label.
+2. Strip the accessibility prefix: rows begin `"Claude responded: "` or
+   `"You said: "` followed by a duplicate of the message's opening fragment.
+3. Strip the trailing timestamp: `"just now"`, `"5 days ago"`.
+
+That covers prose and code. Real claude.ai turns also contain structures
+that are not prose, each needing a decision:
+
+| Structure | Bubble behaviour |
+|---|---|
+| Artifact panel | `[artifact: <title>]`. Do not mirror the panel. |
+| Extended thinking | Skip, or `[thinking]`. Decide once, be consistent. |
+| Tool use / search | `[searched: <query>]`. Do not mirror result cards. |
+| Citations | Strip interactive markup, keep visible text. |
+| Images | `[image]`. The relay carries text only. |
+
+None of these fall out of generic HTML-to-Markdown conversion.
 
 ## 8. Known risks
 
 | Risk | Severity | Handling |
 |---|---|---|
-| Selectors break on an Anthropic frontend deploy | High, recurring | No mitigation for the breakage itself — expect periodic manual repair. The extension reports `capture.ok: false` on `status` (§4) when a known selector fails to resolve, so the bubble shows "extension connected, capture broken" instead of looking identically dead to "extension offline." |
-| Injection technique rejected by the composer's editor | Project-ending if unsolvable | Must be tested before anything else is built. See PROMPTS.md Phase 0. |
-| Terms of service | Account suspension | Automated interaction with the consumer interface is outside what the terms permit. The exposure is the operator's account and its history. This is accepted knowingly for personal use. It is **not** accepted for distribution. |
-| claude.ai tab closed or discarded by Chrome memory saver | Bubble silently dead | `peers` message drives an explicit offline state in the bubble UI. |
+| Selectors break on an Anthropic frontend update | High, recurring | No mitigation available. Expect periodic manual repair. Failure is silent, so `capture` health must be visible in the UI. |
+| Injection rejected by the TipTap editor | **Resolved 2026-08-27** | `execCommand('insertText')` works: text lands and the send button enables. Synthetic paste also works as a backup. |
+| Chrome Local Network Access permission revoked | Bubble stops receiving, silently | **Transport confirmed working 2026-08-27.** Chrome 142+ gates localhost access behind a per-site permission rather than blocking it. Granted for claude.ai. Clearing site data or resetting site permissions revokes it. The extension should check `navigator.permissions.query({name:'local-network-access'})` on load and surface a clear message if the state is not `granted`, rather than failing as a connection error. |
+| Terms of service | Account suspension | Automated interaction with the consumer interface is outside what the terms permit. The exposure is the operator's account and its history. Accepted knowingly for personal use. Not accepted for distribution. |
+| claude.ai tab closed or discarded by Chrome memory saver | Bubble silently dead | `peers` drives an explicit offline state in the UI. |
+| Other extensions hooking the composer | Injection silently fails or double-fires | Grammarly and QuillBot both hook contenteditable on claude.ai. Confirmed present. Test with them disabled. |
+| Desktop app not running | Extension has nowhere to connect | Extension reconnects with backoff and reports offline in its options page. |
 
-## 9. Corrections to the original scope document
+## 9. What is deliberately absent
 
-1. **URL format.** The original said the session token derives from "the
-   `session_...` value in the URL." There is no such value. Conversation URLs are
-   `claude.ai/chat/<uuid>`; `sessionKey` is the authentication cookie. The two
-   were conflated.
-2. **Durable Object storage backend.** The original did not mention that the
-   Workers Free plan can only create SQLite-backed Durable Objects. A
-   `new_classes` migration fails to deploy.
-3. **In-memory history.** The original stored history in memory. Durable Objects
-   are evicted; memory does not survive. Use the storage API.
-4. **Build order.** The original scheduled the Worker first and DOM discovery
-   fourth, while stating the Worker had no unknowns. The riskiest component must
-   be validated first.
-5. **Streaming.** The original did not address it at all. It is the hardest part
-   of the capture logic and it determines the message protocol.
-6. **Security.** The original treated "no viewer page exists" as a protection.
-   It is not one. §5 replaces that.
+- No database. A JSON file in userData is sufficient.
+- No cloud service, no account, no deploy step, no free-tier limits.
+- No build step for the extension. Vanilla JS.
+- No auth system beyond the pairing token.
+- No telemetry.
 
-## 10. Changes in v2.1
+## 10. Changes in version 3
 
-Applied after review of v2 surfaced two problems that would not have worked as
-written. Both are now locked decisions in CLAUDE.md; this section is the
-record of why.
+The bubble was respecified as a desktop overlay that floats above other
+applications and stays available when switching apps. A web page cannot do that —
+it lives inside a browser tab and disappears on app switch.
 
-1. **Room key no longer includes the conversation ID.** v2 derived the room
-   key from `secret + conversationId`. Since the extension is required to
-   re-key on SPA navigation (§3.1.7), switching conversations pointed it at a
-   new, empty Durable Object while the bubble stayed connected to the old one
-   — the two surfaces would silently stop talking to each other. The key is
-   now `SHA-256(secret)` alone (§5); the active conversation travels over the
-   protocol as a `conversation` message instead.
-2. **History on attach was unaddressed.** v2's extension responsibilities said
-   only to observe the conversation container "for new and changing message
-   nodes" — a `MutationObserver` never sees nodes that existed before it
-   attached. Opening the bubble on a conversation that already had turns in it
-   would have shown an empty history until the next new message. `turn.snapshot`
-   (§4) now backfills whatever is already rendered, both on first attach and
-   after every conversation switch.
-3. Added `conversation` and `turn.snapshot` to the protocol (§4), and folded
-   capture health into `status` rather than adding a fourth message type, to
-   keep the protocol surface as small as it can be while still fixing (1) and
-   (2).
-4. Made explicit (§2) that switching conversations replaces the room's stored
-   turns rather than merging across conversations — the room mirrors exactly
-   one conversation at a time, per the non-goal that was already there in v2.
+Consequences:
+
+1. **Cloudflare Worker and Durable Object removed.** With both ends of the relay
+   on one machine, a round trip to the internet served no purpose. The `worker/`
+   directory stays in the repo, unused, in case remote access is ever wanted.
+2. **Electron chosen over Tauri.** Tauri produces smaller binaries but requires
+   Rust. Electron is JavaScript throughout, the existing React bubble ports
+   nearly unchanged, and macOS supports the exact window behaviour needed.
+3. **Three components became two.** The desktop app is both relay and UI.
+4. **SQLite replaced by a JSON file.** No free-tier write budget to respect, so
+   the storage constraints that shaped v2 no longer apply.
+5. **Security model rewritten.** No public endpoint. The threat is now local
+   pages probing localhost, handled by binding, origin check, and pairing token.
+6. **Token direction reversed.** The desktop app generates it; the extension
+   receives it. Previously the extension owned the secret.
+7. **Protocol §4 survives intact** apart from dropping `room`.
+
+Prior version retained as `SPEC_v2_archive.md`.
