@@ -11,4 +11,8 @@ contextBridge.exposeInMainWorld("bubble", {
     node: process.versions.node,
   },
   hide: () => ipcRenderer.send("bubble:hide"),
+  sendPrompt: (promptId, text) => ipcRenderer.send("bubble:prompt", { promptId, text }),
+  onServerEvent: (callback) => {
+    ipcRenderer.on("server-event", (_event, data) => callback(data));
+  },
 });
