@@ -20,8 +20,8 @@ const { loadStore, saveStore } = require("./store");
 const HOST = "127.0.0.1";
 const PORT = 8787;
 
-// Generous enough for a long turn.snapshot backfill of a big conversation,
-// small enough to bound how much memory one message can force us to hold.
+// Generous enough for a big harvested turn.window batch, small enough to
+// bound how much memory one message can force us to hold.
 const MAX_MESSAGE_BYTES = 5 * 1024 * 1024;
 
 function isAllowedOrigin(origin) {
@@ -50,9 +50,12 @@ function createBubbleServer({ userDataDir, getToken, onEvent }) {
     send(ws, { type: "error", code, message });
   }
 
+  // turns is a sparse map of index -> {role, text}. The transcript is
+  // virtualized (SPEC.md §4.1) so what's loaded can have gaps until the
+  // operator scrolls up far enough to harvest them.
   function getConversation(conversationId) {
     if (!store.conversations[conversationId]) {
-      store.conversations[conversationId] = { title: "", updatedAt: Date.now(), turns: [] };
+      store.conversations[conversationId] = { title: "", updatedAt: Date.now(), total: 0, turns: {} };
     }
     return store.conversations[conversationId];
   }
@@ -63,7 +66,12 @@ function createBubbleServer({ userDataDir, getToken, onEvent }) {
 
   function sendHistory(conversationId) {
     const convo = conversationId ? store.conversations[conversationId] : null;
-    emit({ type: "history", conversationId, turns: convo ? convo.turns : [] });
+    emit({
+      type: "history",
+      conversationId,
+      total: convo ? convo.total : 0,
+      turns: convo ? convo.turns : {},
+    });
   }
 
   httpServer.on("upgrade", (req, socket, head) => {
@@ -161,26 +169,31 @@ function createBubbleServer({ userDataDir, getToken, onEvent }) {
         break;
       }
 
-      case "turn.snapshot": {
+      case "turn.window": {
         const conversationId = msg.conversationId;
         if (!conversationId || !Array.isArray(msg.turns)) {
-          sendError(ws, "MALFORMED", "turn.snapshot needs a conversationId and a turns array.");
+          sendError(ws, "MALFORMED", "turn.window needs a conversationId and a turns array.");
           return;
         }
         currentConversationId = conversationId;
         const convo = getConversation(conversationId);
-        convo.turns = msg.turns.map((t, i) => ({
-          seq: typeof t.seq === "number" ? t.seq : i,
-          role: t.role,
-          text: t.text,
-          turnId: null,
-          ts: null,
-          origin: null,
-          promptId: null,
-        }));
+        // Merge by index — never replace. The window is a partial view of a
+        // virtualized transcript; replacing would discard everything outside
+        // whatever happens to be rendered right now. An index already stored
+        // is updated in place, a new one is added. See SPEC.md §4.1.
+        for (const t of msg.turns) {
+          if (typeof t.index !== "number") continue;
+          convo.turns[t.index] = { role: t.role, text: t.text };
+        }
+        if (typeof msg.total === "number") {
+          convo.total = Math.max(convo.total || 0, msg.total);
+        }
         convo.updatedAt = Date.now();
         persist();
-        sendHistory(conversationId);
+        // Forward the raw window, not the merged store, so the renderer does
+        // its own index merge into what it has on screen — the same rule
+        // applies on both ends.
+        emit({ type: "turn.window", conversationId, total: convo.total, turns: msg.turns });
         break;
       }
 
@@ -226,15 +239,12 @@ function createBubbleServer({ userDataDir, getToken, onEvent }) {
         }
         if (currentConversationId) {
           const convo = getConversation(currentConversationId);
-          convo.turns.push({
-            seq: convo.turns.length,
-            role: (pending && pending.role) || "assistant",
-            text: msg.text,
-            turnId: msg.turnId,
-            ts: (pending && pending.ts) || Date.now(),
-            origin: (pending && pending.origin) || "native",
-            promptId: (pending && pending.promptId) || null,
-          });
+          // A completed live turn is a genuinely new message, one past
+          // whatever total we already knew about — assign it the next index
+          // and grow the total to match, same indexed space turn.window uses.
+          const index = convo.total || 0;
+          convo.turns[index] = { role: (pending && pending.role) || "assistant", text: msg.text };
+          convo.total = index + 1;
           convo.updatedAt = Date.now();
           persist();
         }
@@ -264,6 +274,14 @@ function createBubbleServer({ userDataDir, getToken, onEvent }) {
     return true;
   }
 
+  // The bubble asks for older messages over IPC (it never touches the
+  // socket); this is the relay half described in SPEC.md §4's history.request.
+  function sendHistoryRequest(conversationId, beforeIndex) {
+    if (!extensionSocket) return false;
+    send(extensionSocket, { type: "history.request", conversationId, beforeIndex });
+    return true;
+  }
+
   function isExtensionConnected() {
     return !!extensionSocket;
   }
@@ -281,7 +299,7 @@ function createBubbleServer({ userDataDir, getToken, onEvent }) {
     console.log(`[bubble-server] listening on ${HOST}:${PORT}`);
   });
 
-  return { sendPrompt, isExtensionConnected, close };
+  return { sendPrompt, sendHistoryRequest, isExtensionConnected, close };
 }
 
 module.exports = { createBubbleServer, HOST, PORT, MAX_MESSAGE_BYTES };

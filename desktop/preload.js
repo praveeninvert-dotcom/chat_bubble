@@ -12,6 +12,10 @@ contextBridge.exposeInMainWorld("bubble", {
   },
   hide: () => ipcRenderer.send("bubble:hide"),
   sendPrompt: (promptId, text) => ipcRenderer.send("bubble:prompt", { promptId, text }),
+  requestHistory: (conversationId, beforeIndex) =>
+    ipcRenderer.send("bubble:history-request", { conversationId, beforeIndex }),
+  getToken: () => ipcRenderer.invoke("bubble:get-token"),
+  regenerateToken: () => ipcRenderer.invoke("bubble:regenerate-token"),
   onServerEvent: (callback) => {
     ipcRenderer.on("server-event", (_event, data) => callback(data));
   },

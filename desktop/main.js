@@ -1,7 +1,7 @@
 const { app, BrowserWindow, globalShortcut, ipcMain } = require("electron");
 const path = require("node:path");
 const { createBubbleServer } = require("./server");
-const { getOrCreateToken } = require("./token");
+const { getOrCreateToken, regenerateToken } = require("./token");
 
 // Named explicitly so userData lands in a folder called "claude-bubble"
 // instead of "desktop" (Electron's default is the package.json "name",
@@ -36,6 +36,10 @@ function createWindow() {
   win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
 
   win.loadFile(path.join(__dirname, "renderer", "index.html"));
+
+  win.webContents.on("console-message", (_e, level, message, line, sourceId) => {
+    console.log("[bubble-ui-console]", level, `${sourceId}:${line}`, message);
+  });
 
   win.on("closed", () => {
     win = null;
@@ -74,6 +78,18 @@ ipcMain.on("bubble:hide", () => {
 
 ipcMain.on("bubble:prompt", (_event, { promptId, text }) => {
   if (server) server.sendPrompt(promptId, text);
+});
+
+ipcMain.on("bubble:history-request", (_event, { conversationId, beforeIndex }) => {
+  if (server) server.sendHistoryRequest(conversationId, beforeIndex);
+});
+
+ipcMain.handle("bubble:get-token", () => token);
+
+ipcMain.handle("bubble:regenerate-token", () => {
+  token = regenerateToken(app.getPath("userData"));
+  console.log("[bubble-server] pairing token regenerated:", token);
+  return token;
 });
 
 app.on("will-quit", () => {

@@ -1,5 +1,7 @@
-// JSON persistence for conversation turns. See CLAUDE.md conversation with the
-// operator for the file shape: { conversations: { <id>: { title, updatedAt, turns } } }
+// JSON persistence for conversation turns. Shape:
+// { conversations: { <id>: { title, updatedAt, total, turns: { <index>: {role, text} } } } }
+// turns is a sparse map keyed by index, not an array — the transcript is
+// virtualized (SPEC.md §4.1), so what's stored can have gaps.
 const fs = require("node:fs");
 const path = require("node:path");
 
