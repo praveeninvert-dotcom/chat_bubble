@@ -46,9 +46,12 @@ Responsibilities:
    If the state is not `granted`, show the operator a specific message about the
    Local Network Access permission instead of reporting a generic connection
    failure — the two look identical in the console and would waste an hour.
-4. On attach, **backfill**: read every message already rendered on the page and
-   send a `turn.snapshot`. A MutationObserver fires only on changes made after it
-   attaches, so existing turns are otherwise invisible.
+4. On attach, send a `turn.window` containing the rows currently rendered, each
+   with its `data-index` and the total from the `aria-label`. This is a partial
+   view — the transcript is virtualized. See §4.1.
+4a. On `history.request`, harvest older messages by stepping the scroll
+   container upward, sending a `turn.window` per step, then restoring the
+   original scroll position.
 5. Observe the conversation container and emit `turn.start` / `turn.delta` /
    `turn.end` for turns appearing after attach.
 6. Receive `prompt` messages, inject into the composer, submit.
@@ -159,15 +162,26 @@ navigates to a different conversation. `conversationId` may be `null` on
 The server records this, forwards it to the bubble, and sends the bubble the
 stored history for that conversation.
 
-**`turn.snapshot`** — extension only. The full ordered set of turns currently
-rendered, sent on attach and after a conversation change. The server **replaces**
-its stored turns for that conversation rather than appending. The page is the
-source of truth, so replacing is always correct and cannot duplicate on
-reconnect.
+**`turn.window`** — extension only. A **partial** view of the transcript: the
+rows currently rendered, each carrying its true `index` from the page. Sent on
+attach, after a conversation change, and after each harvest step.
+
 ```json
-{ "type": "turn.snapshot", "conversationId": "<id>",
-  "turns": [ { "role": "user" | "assistant", "text": "...", "seq": 0 } ] }
+{ "type": "turn.window", "conversationId": "<id>", "total": 142,
+  "turns": [ { "index": 136, "role": "user", "text": "..." } ] }
 ```
+
+The server **merges by `index`**, keyed per conversation. It never replaces.
+An index already stored is updated in place; an index not stored is inserted in
+order. See §4.1 for why this replaced `turn.snapshot`.
+
+**`history.request`** — bubble to extension, over IPC then relayed. Asks for
+messages the bubble does not yet have.
+```json
+{ "type": "history.request", "conversationId": "<id>", "beforeIndex": 136 }
+```
+The extension harvests the next batch below `beforeIndex` and replies with one or
+more `turn.window` messages.
 
 **`prompt`** — bubble to extension.
 ```json
@@ -225,9 +239,58 @@ disconnects.
 
 - One extension connection at a time. A second is rejected with `ROLE_TAKEN`.
   This happens when claude.ai is open in two tabs.
-- Persist only on `turn.end` and `turn.snapshot`. Never on `turn.delta`.
+- Persist only on `turn.end` and `turn.window`. Never on `turn.delta`.
+- `turn.window` merges by `index`. It never replaces the stored set.
 - Unrecognised message types are dropped, not forwarded.
 - Maximum message size enforced; oversized messages rejected.
+
+### 4.1 The transcript is virtualized
+
+**Confirmed 2026-08-27.** claude.ai renders only the rows near the viewport and
+destroys the rest. In a 142-message conversation, 6 rows were in the DOM,
+indices 136–141. Everything below index 136 did not exist as DOM at all.
+
+Markers: `transcript-sizer`, `data-rs-index`, `data-perf-row-from-tail`,
+`last-message-sentinel`.
+
+**The DOM is a window onto the conversation, not the conversation.** Three rules
+follow, and violating any of them corrupts history:
+
+1. **Never replace stored turns from a partial view.** The original
+   `turn.snapshot` design replaced everything with what was visible — in a long
+   chat that means discarding 142 messages and keeping 6. Merge by `index`
+   instead. `data-index` on the row is stable and authoritative.
+2. **Row removal is never a deletion.** Rows leaving the viewport are destroyed
+   by the virtualizer. The MutationObserver must ignore removals entirely.
+3. **A re-added row is not a new message.** An index already stored means the
+   user scrolled. Only an index above the current maximum is genuinely new.
+
+**Total message count** comes from `aria-label="Message 137 of 142"` on the
+row's first child. The bubble uses this to show what it has versus what exists.
+
+**Harvesting older messages.** Confirmed working: setting `scrollTop = 0` on the
+scroll container renders index 0, and restoring `scrollTop` returns to position.
+
+The scroll container is the nearest ancestor of `[data-testid="transcript-list"]`
+with `overflow-y: auto` and real overflow. Do not hardcode a class name; walk up
+and test computed style.
+
+Harvest is **on demand, not on attach.** Scraping 142 messages on every attach
+would leave the bubble blank for seconds while claude.ai visibly scrolls. Instead:
+
+- On attach, send whatever is rendered as a `turn.window`.
+- When the bubble scrolls to the top of what it has, it sends
+  `history.request`. The extension steps `scrollTop` upward, captures each
+  window, and restores the original position when done.
+- One jump to the top is not sufficient. It renders only the first few rows;
+  intermediate positions must be stepped through to cover the middle.
+- The claude.ai tab is in the background while the bubble is in use, so the
+  scrolling is invisible to the operator. Restore position regardless, in case
+  it is not.
+
+**`last-message-sentinel` stays mounted even when scrolled to the top.** The
+presence of the highest index does not mean the view is at the bottom. Do not
+use it as a position check.
 
 ### Echo handling
 
@@ -349,6 +412,8 @@ None of these fall out of generic HTML-to-Markdown conversion.
 | claude.ai tab closed or discarded by Chrome memory saver | Bubble silently dead | `peers` drives an explicit offline state in the UI. |
 | Other extensions hooking the composer | Injection silently fails or double-fires | Grammarly and QuillBot both hook contenteditable on claude.ai. Confirmed present. Test with them disabled. |
 | Desktop app not running | Extension has nowhere to connect | Extension reconnects with backoff and reports offline in its options page. |
+| Virtualized transcript corrupts history | **Resolved by design 2026-08-27** | Confirmed: 6 of 142 rows in DOM. Merge by `index`, ignore removals, harvest on demand. See §4.1. |
+| Image exceeds max message size | Attachment silently rejected | A phone photo of 4MB becomes ~5.3MB base64, over the 5MB cap. Send images as binary WebSocket frames, or downscale in the bubble before encoding. Decide in Phase 3. |
 | macOS Local Network privacy prompt | Possible silent failure | Distinct from Chrome's Local Network Access. Apple's prompt targets LAN and Bonjour discovery; pure loopback inside one process is unlikely to trigger it, and the app is both server and only local client. Untested. If a prompt appears during Phase 1, allow it and record the result here. |
 
 ## 9. What is deliberately absent
@@ -381,10 +446,13 @@ Consequences:
 6. **Token direction reversed.** The desktop app generates it; the extension
    receives it. Previously the extension owned the secret.
 7. **Protocol §4 survives intact** apart from dropping `room`.
-8. **The bubble stopped being a WebSocket client.** It is in the same process as
+8. **`turn.snapshot` became `turn.window`, merge instead of replace.** The
+   transcript is virtualized; the original replace-on-snapshot design would have
+   destroyed history. See §4.1.
+9. **The bubble stopped being a WebSocket client.** It is in the same process as
    the server, so it uses IPC. This removed a connection, a role, an origin
    problem, and a class of failure. Found during the v3 orientation review.
-9. **The §5 origin check was stated inverted** in an intermediate revision and is
+10. **The §5 origin check was stated inverted** in an intermediate revision and is
    now written as an explicit allowlist with code.
 
 Prior version retained as `SPEC_v2_archive.md`.

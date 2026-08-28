@@ -89,6 +89,10 @@ Unblocked — Phase 0 passed 2026-08-27.
 - [ ] manifest.json, loads unpacked without errors
 - [ ] Options page accepts the pairing token
 - [ ] Content script connects to the local server
+- [ ] turn.window merges by index, never replaces
+- [ ] Row removals ignored (virtualizer destroys rows on scroll)
+- [ ] history.request harvests older messages by stepped scrolling
+- [ ] Scroll position restored after every harvest
 - [ ] Backfill of already-rendered turns
 - [ ] MutationObserver captures user turns
 - [ ] Assistant turns captured with deltas and a correct turn.end
@@ -115,6 +119,11 @@ Unblocked — Phase 0 passed 2026-08-27.
 ---
 
 ## Open questions
+
+- Images: binary WebSocket frames, or downscale in the bubble before base64? A
+  4MB phone photo exceeds the 5MB message cap once encoded.
+- How many scroll steps is a full harvest of a 500-message conversation, and is
+  that acceptable?
 
 - Does the send-button state change reliably signal completion during tool use?
 - Does the assistant message node carry its own streaming attribute? Check in

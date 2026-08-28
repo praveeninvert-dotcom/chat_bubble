@@ -204,6 +204,28 @@ Raw sample for reference:
 "Claude responded: That's it.\n\npython\ndef reverse_string(s):\n    return s[::-1]\n\nThat's it. Python's slice syntax with -1 step walks the string backwards.\n\n\npython\nreverse_string(\"hello\")  # \"olleh\"\n\n\n\n\n\njust now"
 ```
 
+### Virtualization — CONFIRMED 2026-08-27
+
+The transcript renders only rows near the viewport. Measured on a 142-message
+conversation: **6 rows in the DOM**, indices 136–141.
+
+| Fact | Value |
+|---|---|
+| Scroll container | Nearest ancestor of `[data-testid="transcript-list"]` with `overflow-y: auto` and real overflow. Class was `overflow-y-auto overflow-x-hidden [scrollbar-gutter:stable]` — **do not hardcode**, walk up and test computed style. |
+| True row index | `data-index` on the row. Stable and authoritative. |
+| Total message count | Parse from `aria-label="Message 137 of 142"` on the row's first child. |
+| Harvesting works | `scroller.scrollTop = 0` renders index 0 after ~1200ms. Restoring `scrollTop` returns to position. |
+| One jump is not enough | Top gives 0–5, bottom gives 136–141. Middle indices need intermediate scroll steps. |
+| Sentinel stays mounted | The highest index remains in the DOM even when scrolled to the top (`last-message-sentinel`). Do not use its presence as a position check. |
+
+Measured sequence:
+
+```
+BEFORE            count: 6  range: 136-141
+AFTER scrollTop=0 count: 7  range: 0-141
+RESTORED                    range: 131-141
+```
+
 ### Still to observe
 
 These were not part of Phase 0 and can be handled when encountered:
