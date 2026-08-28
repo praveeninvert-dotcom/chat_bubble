@@ -11,14 +11,37 @@ function storePath(userDataDir) {
   return path.join(userDataDir, STORE_FILE);
 }
 
+function isPlainObject(value) {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+// Every read in server.js assumes store.conversations[id].turns is a plain
+// object it can index into (convo.turns[index] = ...). A file that's valid
+// JSON but the wrong shape — a string, an array, a conversation with turns
+// as something other than an object — is just as unusable as corrupt JSON.
+function isValidStoreShape(data) {
+  if (!isPlainObject(data) || !isPlainObject(data.conversations)) return false;
+  for (const convo of Object.values(data.conversations)) {
+    if (!isPlainObject(convo)) return false;
+    if (convo.turns !== undefined && !isPlainObject(convo.turns)) return false;
+  }
+  return true;
+}
+
 function loadStore(userDataDir) {
   const file = storePath(userDataDir);
   try {
     const raw = fs.readFileSync(file, "utf8");
     const data = JSON.parse(raw);
-    if (data && typeof data === "object" && data.conversations) return data;
-  } catch {
-    // Missing file on first run, or corrupt JSON — start fresh rather than crash.
+    if (isValidStoreShape(data)) return data;
+    console.error("[bubble-server] conversations.json has an unexpected shape, starting fresh instead of using it:", file);
+  } catch (err) {
+    // Missing file on first run is normal and not worth logging. Anything
+    // else (corrupt JSON, a read error) starts fresh rather than crashing,
+    // but is worth a log line since it silently drops whatever was there.
+    if (err.code !== "ENOENT") {
+      console.error("[bubble-server] conversations.json could not be read, starting fresh:", err.message);
+    }
   }
   return { conversations: {} };
 }

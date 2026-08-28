@@ -24,6 +24,10 @@ const PORT = 8787;
 // bound how much memory one message can force us to hold.
 const MAX_MESSAGE_BYTES = 5 * 1024 * 1024;
 
+// How often an in-progress streaming reply gets written to disk, so a crash
+// or dropped connection mid-reply doesn't lose everything received so far.
+const PARTIAL_FLUSH_MS = 500;
+
 function isAllowedOrigin(origin) {
   return origin === "https://claude.ai" || origin.startsWith("chrome-extension://");
 }
@@ -36,7 +40,7 @@ function createBubbleServer({ userDataDir, getToken, onEvent }) {
 
   let extensionSocket = null;
   let currentConversationId = null;
-  const pendingTurns = new Map(); // turnId -> { role, origin, promptId, ts }
+  const pendingTurns = new Map(); // turnId -> { role, origin, promptId, ts, buffer, index, flushTimer }
 
   function emit(event) {
     if (onEvent) onEvent(event);
@@ -62,6 +66,27 @@ function createBubbleServer({ userDataDir, getToken, onEvent }) {
 
   function persist() {
     saveStore(userDataDir, store);
+  }
+
+  // Writes the buffer accumulated so far for an in-progress turn to disk,
+  // marked `partial`. Called on a debounce during streaming (not on every
+  // delta) so a crash or dropped connection mid-reply still leaves most of
+  // it recoverable. turn.end overwrites the same index with the finished
+  // text; if that never comes, the next turn.window merge for that index
+  // (SPEC.md §4.1) overwrites it just like any other stored turn.
+  function flushPartialTurn(turnId) {
+    const pending = pendingTurns.get(turnId);
+    if (!pending) return;
+    pending.flushTimer = null;
+    if (!currentConversationId) return;
+    const convo = getConversation(currentConversationId);
+    if (pending.index == null) {
+      pending.index = convo.total || 0;
+      convo.total = pending.index + 1;
+    }
+    convo.turns[pending.index] = { role: pending.role || "assistant", text: pending.buffer, partial: true };
+    convo.updatedAt = Date.now();
+    persist();
   }
 
   function sendHistory(conversationId) {
@@ -133,12 +158,22 @@ function createBubbleServer({ userDataDir, getToken, onEvent }) {
         sendError(ws, "MALFORMED", "Message is missing a type field.");
         return;
       }
-      handleMessage(ws, msg);
+      // A malformed-but-well-typed message (e.g. a bad shape nested inside
+      // an otherwise valid envelope) should be logged and dropped, not take
+      // the whole app down with it.
+      try {
+        handleMessage(ws, msg);
+      } catch (err) {
+        console.error("[bubble-server] error handling message, dropped:", msg.type, err && err.message);
+      }
     });
 
     ws.on("close", () => {
       if (extensionSocket === ws) {
         extensionSocket = null;
+        for (const pending of pendingTurns.values()) {
+          if (pending.flushTimer) clearTimeout(pending.flushTimer);
+        }
         pendingTurns.clear();
         console.log("[bubble-server] extension disconnected");
         emit({ type: "peers", extension: false });
@@ -159,6 +194,9 @@ function createBubbleServer({ userDataDir, getToken, onEvent }) {
 
       case "conversation": {
         currentConversationId = msg.conversationId || null;
+        for (const pending of pendingTurns.values()) {
+          if (pending.flushTimer) clearTimeout(pending.flushTimer);
+        }
         pendingTurns.clear();
         if (currentConversationId) {
           const convo = getConversation(currentConversationId);
@@ -182,7 +220,7 @@ function createBubbleServer({ userDataDir, getToken, onEvent }) {
         // whatever happens to be rendered right now. An index already stored
         // is updated in place, a new one is added. See SPEC.md §4.1.
         for (const t of msg.turns) {
-          if (typeof t.index !== "number") continue;
+          if (!t || typeof t !== "object" || typeof t.index !== "number") continue;
           convo.turns[t.index] = { role: t.role, text: t.text };
         }
         if (typeof msg.total === "number") {
@@ -207,6 +245,9 @@ function createBubbleServer({ userDataDir, getToken, onEvent }) {
           origin: msg.origin,
           promptId: msg.promptId || null,
           ts: msg.ts || Date.now(),
+          buffer: "",
+          index: null,
+          flushTimer: null,
         });
         emit({
           type: "turn.start",
@@ -224,6 +265,13 @@ function createBubbleServer({ userDataDir, getToken, onEvent }) {
           sendError(ws, "MALFORMED", "turn.delta needs a turnId.");
           return;
         }
+        const pending = pendingTurns.get(msg.turnId);
+        if (pending) {
+          pending.buffer += msg.text || "";
+          if (!pending.flushTimer) {
+            pending.flushTimer = setTimeout(() => flushPartialTurn(msg.turnId), PARTIAL_FLUSH_MS);
+          }
+        }
         emit({ type: "turn.delta", turnId: msg.turnId, text: msg.text });
         break;
       }
@@ -237,14 +285,20 @@ function createBubbleServer({ userDataDir, getToken, onEvent }) {
         if (!pending) {
           console.log("[bubble-server] turn.end with no matching turn.start:", msg.turnId);
         }
+        if (pending && pending.flushTimer) {
+          clearTimeout(pending.flushTimer);
+          pending.flushTimer = null;
+        }
         if (currentConversationId) {
           const convo = getConversation(currentConversationId);
-          // A completed live turn is a genuinely new message, one past
-          // whatever total we already knew about — assign it the next index
-          // and grow the total to match, same indexed space turn.window uses.
-          const index = convo.total || 0;
+          // Reuse the index a partial flush already reserved during
+          // streaming, if there was one, so the finished text lands in the
+          // same slot instead of a second one. Otherwise this is a
+          // completed live turn with no prior partial save — assign it the
+          // next index, same indexed space turn.window uses.
+          const index = pending && pending.index != null ? pending.index : convo.total || 0;
           convo.turns[index] = { role: (pending && pending.role) || "assistant", text: msg.text };
-          convo.total = index + 1;
+          convo.total = Math.max(convo.total || 0, index + 1);
           convo.updatedAt = Date.now();
           persist();
         }
