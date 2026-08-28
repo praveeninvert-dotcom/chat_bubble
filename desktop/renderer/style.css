@@ -61,19 +61,26 @@ html, body {
 
 .icon-btn {
   -webkit-app-region: no-drag;
-  background: rgba(255, 255, 255, 0.12);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
   border: none;
-  color: #eee;
+  color: #8a8a90;
   width: 22px;
   height: 22px;
-  border-radius: 5px;
-  font-size: 14px;
-  line-height: 1;
+  border-radius: 6px;
   cursor: pointer;
+  transition: background-color 0.12s ease, color 0.12s ease;
+}
+
+.icon-btn svg {
+  display: block;
 }
 
 .icon-btn:hover {
-  background: rgba(255, 255, 255, 0.22);
+  background: rgba(255, 255, 255, 0.12);
+  color: #eee;
 }
 
 /* ---------- health ---------- */
@@ -119,6 +126,29 @@ html, body {
   min-height: 0;
 }
 
+/* Chromium-only (this is Electron) — dark, thin scrollbars instead of the
+   light, thick OS default, on both the message list and the composer. */
+.message-list::-webkit-scrollbar,
+#composer-input::-webkit-scrollbar {
+  width: 6px;
+}
+
+.message-list::-webkit-scrollbar-track,
+#composer-input::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.message-list::-webkit-scrollbar-thumb,
+#composer-input::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 3px;
+}
+
+.message-list::-webkit-scrollbar-thumb:hover,
+#composer-input::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.25);
+}
+
 .loading-older {
   text-align: center;
   font-size: 11px;
@@ -160,7 +190,7 @@ html, body {
 }
 
 .turn-user .turn-content {
-  background: #3a6df0;
+  background: #46464e;
   color: #fff;
   border-bottom-right-radius: 4px;
 }
@@ -283,25 +313,38 @@ html, body {
   background: rgba(255, 255, 255, 0.02);
 }
 
-#composer-input {
+/* Rounded pill + clipping live here, on a non-scrolling wrapper — overflow:
+   hidden is what actually guarantees the textarea's content and scrollbar
+   can't render past the rounded corners. border-radius on the textarea
+   itself doesn't reliably clip a form control's own scroll viewport. */
+.composer-input-wrap {
   flex: 1 1 auto;
+  border-radius: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.06);
+  overflow: hidden;
+}
+
+.composer-input-wrap:focus-within {
+  border-color: rgba(255, 255, 255, 0.3);
+}
+
+#composer-input {
+  display: block;
+  width: 100%;
   resize: none;
   min-height: 32px;
   max-height: 140px;
   overflow-y: auto;
-  padding: 8px 12px;
-  border-radius: 16px;
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  background: rgba(255, 255, 255, 0.06);
+  /* extra right padding so text doesn't run under the scrollbar thumb */
+  padding: 8px 16px 8px 12px;
+  border: none;
+  background: transparent;
   color: #eee;
   font-family: inherit;
   font-size: 13px;
   line-height: 1.4;
   outline: none;
-}
-
-#composer-input:focus {
-  border-color: rgba(255, 255, 255, 0.3);
 }
 
 #composer-input::placeholder {
@@ -314,7 +357,7 @@ html, body {
   height: 32px;
   border-radius: 50%;
   border: none;
-  background: #3a6df0;
+  background: #c15f3c;
   color: #fff;
   display: flex;
   align-items: center;
@@ -323,7 +366,7 @@ html, body {
 }
 
 .send-btn:hover:not(:disabled) {
-  background: #4c7bf5;
+  background: #ae5636;
 }
 
 .send-btn:disabled {

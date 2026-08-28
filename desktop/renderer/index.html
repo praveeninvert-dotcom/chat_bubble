@@ -10,11 +10,25 @@
     <div class="header">
       <div class="header-left">
         <span class="health-dot" id="health-dot" title=""></span>
-        <span class="title" id="title-text">Claude Bubble</span>
+        <span class="title" id="title-text">Claude</span>
       </div>
       <div class="header-right">
-        <button id="settings-btn" class="icon-btn" title="Settings">⚙</button>
-        <button id="hide-btn" class="icon-btn" title="Hide (⌘⇧C to show again)">×</button>
+        <button id="settings-btn" class="icon-btn" title="Settings">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="4" y1="6" x2="20" y2="6"></line>
+            <circle cx="9" cy="6" r="2"></circle>
+            <line x1="4" y1="12" x2="20" y2="12"></line>
+            <circle cx="15" cy="12" r="2"></circle>
+            <line x1="4" y1="18" x2="20" y2="18"></line>
+            <circle cx="7" cy="18" r="2"></circle>
+          </svg>
+        </button>
+        <button id="hide-btn" class="icon-btn" title="Hide (⌘⇧C to show again)">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="5" y1="5" x2="19" y2="19"></line>
+            <line x1="19" y1="5" x2="5" y2="19"></line>
+          </svg>
+        </button>
       </div>
     </div>
 
@@ -30,11 +44,13 @@
     </div>
 
     <div class="composer">
-      <textarea
-        id="composer-input"
-        placeholder="Message Claude…"
-        rows="1"
-      ></textarea>
+      <div class="composer-input-wrap">
+        <textarea
+          id="composer-input"
+          placeholder="Message Claude…"
+          rows="1"
+        ></textarea>
+      </div>
       <button id="send-btn" class="send-btn" disabled title="Send (Enter)">
         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
           <path d="M12 19V5M5 12l7-7 7 7" stroke-linecap="round" stroke-linejoin="round" />
@@ -46,7 +62,12 @@
       <div class="settings-panel">
         <div class="settings-header">
           <span>Settings</span>
-          <button id="settings-close" class="icon-btn" title="Close">×</button>
+          <button id="settings-close" class="icon-btn" title="Close">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="5" y1="5" x2="19" y2="19"></line>
+              <line x1="19" y1="5" x2="5" y2="19"></line>
+            </svg>
+          </button>
         </div>
         <div class="settings-body">
           <label class="settings-label">Pairing token</label>
