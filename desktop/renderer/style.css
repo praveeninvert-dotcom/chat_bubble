@@ -83,6 +83,19 @@ html, body {
   color: #eee;
 }
 
+/* Settings and hide, specifically — not the settings panel's own close
+   button, which stays on the plain (non-circular) .icon-btn look above. */
+.header-right .icon-btn {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.header-right .icon-btn:hover {
+  background: rgba(255, 255, 255, 0.16);
+}
+
 /* ---------- health ---------- */
 
 .health-dot {
@@ -333,11 +346,15 @@ html, body {
   display: block;
   width: 100%;
   resize: none;
-  min-height: 32px;
+  /* 30px here + the wrap's 1px top/bottom border = 32px total, matching
+     .send-btn's 32px exactly so their edges line up at rest. Padding is
+     symmetric top/bottom so the placeholder and first line sit centered
+     in that space rather than pinned to the top. */
+  min-height: 30px;
   max-height: 140px;
   overflow-y: auto;
   /* extra right padding so text doesn't run under the scrollbar thumb */
-  padding: 8px 16px 8px 12px;
+  padding: 6px 16px 6px 12px;
   border: none;
   background: transparent;
   color: #eee;
