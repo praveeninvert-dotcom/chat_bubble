@@ -112,10 +112,63 @@ function createBubbleServer({ userDataDir, getToken, onEvent }) {
   });
 
   wss.on("connection", (ws, req) => {
+    // Attached before any of the guard checks below (bad token, wrong role,
+    // ROLE_TAKEN) so every connection this server ever accepts — rejected or
+    // not — gets one uniform close log, not just the ones that made it to
+    // being "the" extension connection. Diagnosing an unexplained 1006 means
+    // seeing all of them.
+    const connectedAt = Date.now();
+    let closedByServer = false;
+
+    ws.on("close", (code, reasonBuf) => {
+      const reason = reasonBuf && reasonBuf.length ? reasonBuf.toString() : "";
+      const openMs = Date.now() - connectedAt;
+      console.log(
+        `[bubble-server] socket closed: code=${code} reason=${JSON.stringify(reason)} ` +
+          `initiatedByServer=${closedByServer} openMs=${openMs}`
+      );
+      if (extensionSocket === ws) {
+        extensionSocket = null;
+        // pendingTurns is deliberately left alone here. It used to be
+        // cleared unconditionally on every disconnect, which orphaned any
+        // turn still streaming through a benign reconnect (see the 2026-08-29
+        // finding below case "turn.end") — the turnId → index mapping was
+        // gone by the time turn.end arrived on the new connection, and the
+        // guess-based fallback that used to run instead is what corrupted a
+        // conversation's history. pendingTurns is a single Map shared across
+        // the server's whole lifetime (declared once, above, not per
+        // connection), so it already survives a reconnect intact without
+        // needing anything special here — a turn.end that arrives on the new
+        // connection can still find its entry. It's only cleared now in case
+        // "conversation", and only when the id actually changes.
+        // flushPartialTurn's timers are unaffected either way: they write to
+        // disk on their own schedule, independent of any socket.
+        console.log("[bubble-server] extension disconnected");
+        emit({ type: "peers", extension: false });
+      }
+    });
+
+    // The `ws` library enforces MAX_MESSAGE_BYTES itself, one level below
+    // handleMessage — an oversized frame never reaches the "message"
+    // listener at all. It surfaces here instead, as a RangeError tagged
+    // WS_ERR_UNSUPPORTED_MESSAGE_LENGTH, right before the library closes the
+    // connection on its own. Logged distinctly so this is never confused
+    // with an unexplained disconnect.
+    ws.on("error", (err) => {
+      if (err && err.code === "WS_ERR_UNSUPPORTED_MESSAGE_LENGTH") {
+        console.log(
+          `[bubble-server] REJECTED message: exceeds ${MAX_MESSAGE_BYTES}-byte limit — ${err.message}`
+        );
+      } else {
+        console.log("[bubble-server] socket error:", err.message);
+      }
+    });
+
     let url;
     try {
       url = new URL(req.url, `http://${HOST}`);
     } catch {
+      closedByServer = true;
       ws.close(1008, "bad request");
       return;
     }
@@ -125,18 +178,21 @@ function createBubbleServer({ userDataDir, getToken, onEvent }) {
     if (token !== getToken()) {
       console.log("[bubble-server] rejected connection: bad token");
       sendError(ws, "BAD_TOKEN", "Pairing token missing or incorrect.");
+      closedByServer = true;
       ws.close();
       return;
     }
     if (role !== "extension") {
       console.log("[bubble-server] rejected connection: role was", JSON.stringify(role));
       sendError(ws, "MALFORMED", "Only role=extension may connect over WebSocket.");
+      closedByServer = true;
       ws.close();
       return;
     }
     if (extensionSocket) {
       console.log("[bubble-server] rejected connection: role already taken");
       sendError(ws, "ROLE_TAKEN", "An extension connection is already active.");
+      closedByServer = true;
       ws.close();
       return;
     }
@@ -167,22 +223,6 @@ function createBubbleServer({ userDataDir, getToken, onEvent }) {
         console.error("[bubble-server] error handling message, dropped:", msg.type, err && err.message);
       }
     });
-
-    ws.on("close", () => {
-      if (extensionSocket === ws) {
-        extensionSocket = null;
-        for (const pending of pendingTurns.values()) {
-          if (pending.flushTimer) clearTimeout(pending.flushTimer);
-        }
-        pendingTurns.clear();
-        console.log("[bubble-server] extension disconnected");
-        emit({ type: "peers", extension: false });
-      }
-    });
-
-    ws.on("error", (err) => {
-      console.log("[bubble-server] socket error:", err.message);
-    });
   });
 
   function handleMessage(ws, msg) {
@@ -193,11 +233,28 @@ function createBubbleServer({ userDataDir, getToken, onEvent }) {
       }
 
       case "conversation": {
-        currentConversationId = msg.conversationId || null;
-        for (const pending of pendingTurns.values()) {
-          if (pending.flushTimer) clearTimeout(pending.flushTimer);
+        const newConversationId = msg.conversationId || null;
+        const idChanged = newConversationId !== currentConversationId;
+        console.log(
+          `[bubble-server] conversation received: id=${newConversationId || "null"} ` +
+            `title=${JSON.stringify(msg.title)} (previous currentConversationId=${currentConversationId}) ` +
+            `idChanged=${idChanged}`
+        );
+        currentConversationId = newConversationId;
+        if (idChanged) {
+          // Only clear when the conversation actually changed. This used to
+          // run unconditionally, including on a same-id reannounce — the
+          // extension resends "conversation" on every reconnect (even a
+          // benign one) and on a title-only update, neither of which means
+          // any in-flight turn stopped belonging to this conversation.
+          // Clearing anyway orphaned it, and turn.end's old guess-based
+          // fallback is what then misfiled it into the wrong conversation's
+          // history (2026-08-29, see case "turn.end").
+          for (const pending of pendingTurns.values()) {
+            if (pending.flushTimer) clearTimeout(pending.flushTimer);
+          }
+          pendingTurns.clear();
         }
-        pendingTurns.clear();
         if (currentConversationId) {
           const convo = getConversation(currentConversationId);
           if (typeof msg.title === "string") convo.title = msg.title;
@@ -240,6 +297,18 @@ function createBubbleServer({ userDataDir, getToken, onEvent }) {
           sendError(ws, "MALFORMED", "turn.start needs a turnId.");
           return;
         }
+        // conversationId (SPEC.md §4, 2026-08-29) is what lets this be
+        // checked against currentConversationId instead of trusted blindly —
+        // the extension always knows which conversation a turn belongs to;
+        // the server otherwise has no way to recover that once pendingTurns
+        // loses the mapping (see case "turn.end").
+        if (msg.conversationId !== currentConversationId) {
+          console.log(
+            `[bubble-server] dropped turn.start: conversationId=${msg.conversationId} does not match ` +
+              `current=${currentConversationId} (turnId=${msg.turnId})`
+          );
+          return;
+        }
         // msg.index (added for retry, SPEC.md §4) is the row's real page
         // index — the same value turn.window uses as its storage key. Using
         // it here too, instead of only falling back to convo.total the way
@@ -273,6 +342,13 @@ function createBubbleServer({ userDataDir, getToken, onEvent }) {
           sendError(ws, "MALFORMED", "turn.delta needs a turnId.");
           return;
         }
+        if (msg.conversationId !== currentConversationId) {
+          console.log(
+            `[bubble-server] dropped turn.delta: conversationId=${msg.conversationId} does not match ` +
+              `current=${currentConversationId} (turnId=${msg.turnId})`
+          );
+          return;
+        }
         const pending = pendingTurns.get(msg.turnId);
         if (pending) {
           pending.buffer += msg.text || "";
@@ -295,6 +371,13 @@ function createBubbleServer({ userDataDir, getToken, onEvent }) {
           sendError(ws, "MALFORMED", "turn.replace needs a turnId.");
           return;
         }
+        if (msg.conversationId !== currentConversationId) {
+          console.log(
+            `[bubble-server] dropped turn.replace: conversationId=${msg.conversationId} does not match ` +
+              `current=${currentConversationId} (turnId=${msg.turnId})`
+          );
+          return;
+        }
         const pending = pendingTurns.get(msg.turnId);
         if (pending) {
           pending.buffer = msg.text || "";
@@ -311,24 +394,47 @@ function createBubbleServer({ userDataDir, getToken, onEvent }) {
           sendError(ws, "MALFORMED", "turn.end needs a turnId.");
           return;
         }
-        const pending = pendingTurns.get(msg.turnId);
-        if (!pending) {
-          console.log("[bubble-server] turn.end with no matching turn.start:", msg.turnId);
+        if (msg.conversationId !== currentConversationId) {
+          // Dropped, not just unpersisted — forwarding it to the bubble
+          // would show text for a conversation the operator isn't even
+          // looking at anymore as if it belonged here.
+          console.log(
+            `[bubble-server] dropped turn.end: conversationId=${msg.conversationId} does not match ` +
+              `current=${currentConversationId} (turnId=${msg.turnId}) — not persisted, not forwarded.`
+          );
+          pendingTurns.delete(msg.turnId);
+          return;
         }
-        if (pending && pending.flushTimer) {
+        const pending = pendingTurns.get(msg.turnId);
+        // No fallback index. This used to be
+        // `pending && pending.index != null ? pending.index : convo.total || 0`
+        // — guessing convo.total when the mapping was gone. That guess is
+        // exactly what wrote one conversation's replies into a different
+        // conversation's history (2026-08-29): pendingTurns had been cleared
+        // by a benign reconnect (see case "conversation" and the socket
+        // "close" handler above) or by the operator genuinely switching
+        // conversations mid-reply, and convo.total pointed at whatever
+        // conversation happened to be current when this orphaned turn.end
+        // finally arrived — not the conversation the reply actually
+        // belonged to. Dropping instead is safe: the next turn.window
+        // resync fills the right index in correctly, straight from the
+        // page, once the row settles (SPEC.md §4.1).
+        if (!pending || pending.index == null) {
+          console.log(
+            `[bubble-server] dropped turn.end: no usable index for turnId=${msg.turnId} ` +
+              `(${pending ? "pendingTurns entry has no index" : "no pendingTurns entry"}) — not persisted, not forwarded.`
+          );
+          pendingTurns.delete(msg.turnId);
+          return;
+        }
+        if (pending.flushTimer) {
           clearTimeout(pending.flushTimer);
           pending.flushTimer = null;
         }
         if (currentConversationId) {
           const convo = getConversation(currentConversationId);
-          // Reuse the index a partial flush already reserved during
-          // streaming, if there was one, so the finished text lands in the
-          // same slot instead of a second one. Otherwise this is a
-          // completed live turn with no prior partial save — assign it the
-          // next index, same indexed space turn.window uses.
-          const index = pending && pending.index != null ? pending.index : convo.total || 0;
-          convo.turns[index] = { role: (pending && pending.role) || "assistant", text: msg.text };
-          convo.total = Math.max(convo.total || 0, index + 1);
+          convo.turns[pending.index] = { role: pending.role || "assistant", text: msg.text };
+          convo.total = Math.max(convo.total || 0, pending.index + 1);
           convo.updatedAt = Date.now();
           persist();
         }

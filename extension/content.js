@@ -279,6 +279,12 @@ if (typeof module !== "undefined" && module.exports) {
   const state = {
     conversationId: null,
     title: "",
+    // Set once waitForRenderedConversation's initial read is confirmed (see
+    // initDomTracking). Guards handlePossibleConversationChange, which the
+    // title observer can otherwise trigger from a URL read taken before the
+    // SPA has settled — the same race this whole mechanism exists to avoid,
+    // just reached through a second path.
+    initialConversationConfirmed: false,
     container: null,
     rowObserver: null,
     rowDebounceTimer: null,
@@ -559,6 +565,14 @@ if (typeof module !== "undefined" && module.exports) {
   }
 
   function sendConversation() {
+    // DIAGNOSTIC (conversation-switch bug, step 1) — confirms both that this
+    // ran and whether the socket was actually open to receive it: send()
+    // silently no-ops when the socket isn't OPEN, with no retry, so
+    // "detected the switch" and "delivered it" are different questions.
+    log(
+      `Sending conversation: id=${state.conversationId} title=${JSON.stringify(state.title)} ` +
+        `socketOpen=${!!(socket && socket.readyState === WebSocket.OPEN)}`
+    );
     send({ type: "conversation", conversationId: state.conversationId, title: state.title });
   }
 
@@ -621,16 +635,16 @@ if (typeof module !== "undefined" && module.exports) {
     );
     liveTurn.lastText = fullText;
     if (isAppend) {
-      if (delta) send({ type: "turn.delta", turnId: liveTurn.turnId, text: delta });
+      if (delta) send({ type: "turn.delta", turnId: liveTurn.turnId, conversationId: state.conversationId, text: delta });
     } else {
-      send({ type: "turn.replace", turnId: liveTurn.turnId, text: fullText });
+      send({ type: "turn.replace", turnId: liveTurn.turnId, conversationId: state.conversationId, text: fullText });
     }
   }
 
   function finishLiveTurn(idx, liveTurn) {
     stopLiveTurn(liveTurn);
     const finalText = extractRowText(liveTurn.row);
-    send({ type: "turn.end", turnId: liveTurn.turnId, text: finalText });
+    send({ type: "turn.end", turnId: liveTurn.turnId, conversationId: state.conversationId, text: finalText });
     state.liveTurns.delete(idx);
   }
 
@@ -688,8 +702,20 @@ if (typeof module !== "undefined" && module.exports) {
     // soon as the turn starts, rather than waiting for a turn.window/harvest
     // that happens to cover it later. retry (below) needs it, and the
     // message the operator just sent or the reply just received is the most
-    // likely thing to want to retry.
-    send({ type: "turn.start", turnId, role, origin, promptId, ts: Date.now(), index: idx });
+    // likely thing to want to retry. conversationId (SPEC.md §4, 2026-08-29)
+    // lets the server verify this turn still belongs to what it thinks is
+    // current instead of guessing if the mapping is ever lost — see SPEC.md
+    // §4's note on why that guess used to corrupt history.
+    send({
+      type: "turn.start",
+      turnId,
+      role,
+      origin,
+      promptId,
+      conversationId: state.conversationId,
+      ts: Date.now(),
+      index: idx,
+    });
     const liveTurn = { turnId, role, lastText: "", row, textObserver: null };
     state.liveTurns.set(idx, liveTurn);
 
@@ -750,6 +776,7 @@ if (typeof module !== "undefined" && module.exports) {
   }
 
   function handlePossibleConversationChange() {
+    if (!state.initialConversationConfirmed) return;
     const id = getConversationIdFromUrl();
     const title = computeTitle();
     const idChanged = id !== state.conversationId;
@@ -1129,20 +1156,54 @@ if (typeof module !== "undefined" && module.exports) {
     }
   }
 
+  // Confirmed 2026-08-29 (conversation-switch bug): location.pathname is
+  // only trustworthy once claude.ai's own router has settled on it, and a
+  // content script can start running before that happens — a reconnecting
+  // content script announced the PREVIOUS conversation's id because it
+  // trusted a URL read taken at injection time, before a switch had
+  // actually landed. A rendered message row is a much stronger signal:
+  // claude.ai doesn't paint one until it knows which conversation it's
+  // showing. Wait for at least one row before trusting the URL; give up
+  // after INITIAL_ID_CONFIRM_TIMEOUT_MS so a genuinely-empty claude.ai/new
+  // (or a conversation that's just slow to load) isn't stuck waiting
+  // forever — ongoing changes after this are still caught by pollTick as
+  // before, this only guards the very first read.
+  const INITIAL_ID_CONFIRM_TIMEOUT_MS = 3000;
+  const INITIAL_ID_CHECK_MS = 100;
+
+  function waitForRenderedConversation(onConfirmed) {
+    const deadline = Date.now() + INITIAL_ID_CONFIRM_TIMEOUT_MS;
+    function check() {
+      const container = document.querySelector('[data-testid="transcript-list"]');
+      const hasRows = !!(container && container.querySelector('[data-testid="transcript-row"]'));
+      if (hasRows || Date.now() >= deadline) {
+        onConfirmed();
+        return;
+      }
+      setTimeout(check, INITIAL_ID_CHECK_MS);
+    }
+    check();
+  }
+
   function initDomTracking() {
-    state.conversationId = getConversationIdFromUrl();
-    state.title = computeTitle();
-    // No baseline scan here — the baseline is now established inside
-    // sendTurnWindow, from the first successful read of the actually-
-    // rendered DOM (see sendTurnWindow), not a snapshot taken here at
-    // script-injection time, before React may have rendered anything.
+    // Harmless to start immediately — neither sends anything over the
+    // socket, they only track local state and DOM structure.
     observeTitle();
     attachRowObserver();
-    setInterval(pollTick, NAV_POLL_MS);
     setInterval(sendStatus, STATUS_INTERVAL_MS);
-    log(`Initial conversation: id=${state.conversationId || "null"} title=${JSON.stringify(state.title)}`);
+
+    waitForRenderedConversation(() => {
+      state.conversationId = getConversationIdFromUrl();
+      state.title = computeTitle();
+      state.initialConversationConfirmed = true;
+      // No baseline scan here — the baseline is established inside
+      // sendTurnWindow, from the first successful read of the
+      // actually-rendered DOM (see sendTurnWindow).
+      log(`Initial conversation: id=${state.conversationId || "null"} title=${JSON.stringify(state.title)}`);
+      setInterval(pollTick, NAV_POLL_MS);
+      connect();
+    });
   }
 
   initDomTracking();
-  connect();
 })();

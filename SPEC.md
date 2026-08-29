@@ -217,11 +217,31 @@ that — it would need a full re-harvest to converge, and the general
 multi-step `history.request` harvest itself is not yet implemented (only the
 single-row locate `retry` needs).
 
+**All four messages below carry `conversationId`** (added 2026-08-29). Editing
+this in: the extension always knows which conversation a turn belongs to, so
+it says so on every one of these — `turn.start`, `turn.delta`, `turn.replace`,
+and `turn.end` alike — rather than making the server infer it. Before this,
+none of the four carried it, and the server tracked "which conversation is a
+turn for" only through `pendingTurns`, a `turnId → index` map built from
+`turn.start` and consumed by `turn.end`. A reconnect — even a benign one, or a
+same-id `conversation` reannounce from a title update — used to clear that map
+unconditionally, orphaning any turn still streaming through it. `turn.end`'s
+handler then fell back to guessing the write index as `convo.total` of
+whatever conversation happened to be `currentConversationId` at that moment —
+not necessarily the conversation the reply actually belonged to. On
+2026-08-29 this silently wrote one conversation's replies into a different
+conversation's stored history. With `conversationId` on every turn message,
+the server checks it against `currentConversationId` and drops a mismatched
+turn instead of guessing where it goes (see `case "turn.end"` in
+`server.js`) — a dropped turn is recoverable, since the next `turn.window`
+resync fills the correct index in from the page; a misfiled one corrupts
+history permanently.
+
 **`turn.start`** — extension only.
 ```json
 { "type": "turn.start", "turnId": "<random>", "role": "user" | "assistant",
-  "origin": "bubble" | "native", "promptId": "<id or null>", "ts": 0,
-  "index": 137 }
+  "origin": "bubble" | "native", "promptId": "<id or null>",
+  "conversationId": "<id or null>", "ts": 0, "index": 137 }
 ```
 `index` is the row's `data-index` at the moment the turn is first observed —
 the same value `turn.window` carries for the same row (§4.1). Added so the
@@ -232,7 +252,8 @@ reply just received is the most likely thing to want to retry.
 
 **`turn.delta`** — extension only. Text appended to an in-progress turn.
 ```json
-{ "type": "turn.delta", "turnId": "<id>", "text": "chunk" }
+{ "type": "turn.delta", "turnId": "<id>", "conversationId": "<id or null>",
+  "text": "chunk" }
 ```
 
 **`turn.replace`** — extension only. The full current text for a turnId,
@@ -250,13 +271,15 @@ appearing three times, each longer than the last. Both the server
 turnId they already know — the same rule `turn.delta`/`turn.end` already
 follow.
 ```json
-{ "type": "turn.replace", "turnId": "<id>", "text": "current full text" }
+{ "type": "turn.replace", "turnId": "<id>", "conversationId": "<id or null>",
+  "text": "current full text" }
 ```
 
 **`turn.end`** — extension only. `text` is the full final text and is
 authoritative; it replaces whatever the deltas produced.
 ```json
-{ "type": "turn.end", "turnId": "<id>", "text": "complete message text" }
+{ "type": "turn.end", "turnId": "<id>", "conversationId": "<id or null>",
+  "text": "complete message text" }
 ```
 
 **`status`** — extension only, every 20 seconds.
