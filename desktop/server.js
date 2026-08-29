@@ -32,7 +32,11 @@ function isAllowedOrigin(origin) {
   return origin === "https://claude.ai" || origin.startsWith("chrome-extension://");
 }
 
-function createBubbleServer({ userDataDir, getToken, onEvent }) {
+// port defaults to the real app's PORT; overridable so a throwaway server
+// can run for testing (see test-conversation-guard.js) without touching the
+// real one on 8787 or the real conversations.json — main.js never passes
+// this, so the running app's behavior is unchanged.
+function createBubbleServer({ userDataDir, getToken, onEvent, port = PORT }) {
   const store = loadStore(userDataDir);
 
   const httpServer = http.createServer();
@@ -503,8 +507,8 @@ function createBubbleServer({ userDataDir, getToken, onEvent }) {
     console.error("[bubble-server] server error:", err.message);
   });
 
-  httpServer.listen(PORT, HOST, () => {
-    console.log(`[bubble-server] listening on ${HOST}:${PORT}`);
+  httpServer.listen(port, HOST, () => {
+    console.log(`[bubble-server] listening on ${HOST}:${port}`);
   });
 
   return { sendPrompt, sendHistoryRequest, sendRetry, isExtensionConnected, close };

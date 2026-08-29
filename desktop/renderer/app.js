@@ -491,7 +491,6 @@
   function handleTurnStart(msg) {
     let el = null;
     let isNewElement = false;
-    let adopted = false;
     const index = typeof msg.index === "number" ? msg.index : null;
 
     if (msg.origin === "bubble" && msg.promptId && state.pendingOptimistic.has(msg.promptId)) {
@@ -505,9 +504,7 @@
       // (see findTurnElementByIndex) — adopt that element instead of
       // creating a second one for the same slot.
       el = findTurnElementByIndex(index);
-      if (el) {
-        adopted = true;
-      } else {
+      if (!el) {
         el = createTurnElement(msg.role);
         isNewElement = true;
       }
@@ -529,47 +526,14 @@
     state.liveTurns.set(msg.turnId, { el, buffer: "" });
     updateEmptyState();
     updateHistoryBadge();
-
-    // DIAGNOSTIC (message-not-visible bug, 2026-08-29) — insertTurnElement
-    // places by sorted index, so a newly-inserted turn is not necessarily
-    // the LAST element in DOM order: if a HIGHER index is already loaded
-    // from an earlier, gappy sync (turnsInDom below is regularly far short
-    // of total — see the previous "turn.window" logging), the new element
-    // lands ABOVE it instead of at the bottom. scrollToBottom() scrolls to
-    // whatever DOM order says is last, which may not be this element even
-    // when it fires. domOrder/elIsLastInDom below settle that directly;
-    // userScrolledUp/autoScrollFired settle the separate question of
-    // whether the scroll was even attempted.
-    const willAutoScroll = !state.userScrolledUp;
-    if (willAutoScroll) scrollToBottom();
-    const domOrder = Array.from(els.turns.children).map((c) =>
-      c.dataset.index !== undefined ? c.dataset.index : "none"
-    );
-    console.log(
-      `[bubble-ui] turn.start: turnId=${msg.turnId} index=${index} role=${msg.role} ` +
-        `conversationIdOnMessage=N/A(protocol carries none) currentConversation=${state.conversationId} ` +
-        `adopted=${adopted} isNewElement=${isNewElement} elConnected=${el.isConnected} ` +
-        `turnsInDom=${els.turns.children.length}\n` +
-        `  domOrder=[${domOrder.join(",")}] elIsLastInDom=${els.turns.lastElementChild === el} ` +
-        `userScrolledUp=${state.userScrolledUp} autoScrollFired=${willAutoScroll} ` +
-        `scrollTop=${els.messageList.scrollTop} scrollHeight=${els.messageList.scrollHeight} ` +
-        `clientHeight=${els.messageList.clientHeight}`
-    );
+    if (!state.userScrolledUp) scrollToBottom();
   }
 
   function handleTurnDelta(msg) {
     let live = state.liveTurns.get(msg.turnId);
-    const hadLiveTurn = !!live;
     if (!live) {
       // No matching turn.start (e.g. app restarted mid-stream) — start one
       // now so the text isn't silently lost.
-      // DIAGNOSTIC (bug: two elements for the same index): this element
-      // gets NO index at all — turn.delta never carries one — so if a
-      // later turn.window arrives for what should be the same message,
-      // upsertIndexedTurn's lookup can never find this element. Worth
-      // knowing whether this fallback is firing at all. Remove once
-      // resolved.
-      console.log(`[bubble-ui] handleTurnDelta: no live turn for turnId=${msg.turnId} — creating one with NO index.`);
       const el = createTurnElement("assistant");
       insertTurnElement(el, null);
       playEntranceAnimation(el);
@@ -581,18 +545,6 @@
     live.buffer += msg.text || "";
     paintTurn(live.el, live.el.className.includes("turn-user") ? "user" : "assistant", live.buffer);
     if (!state.userScrolledUp) scrollToBottom();
-
-    // DIAGNOSTIC (new-message-not-appearing bug, 2026-08-29) — same protocol
-    // gap as turn.start: no conversationId on this message type, so nothing
-    // here is ever accepted/rejected on that basis. hadLiveTurn=false would
-    // mean turn.start never registered this turnId before the first delta
-    // arrived — that's the one way this path itself could produce an
-    // orphaned, unindexed element instead of updating the right one.
-    console.log(
-      `[bubble-ui] turn.delta: turnId=${msg.turnId} conversationIdOnMessage=N/A(protocol carries none) ` +
-        `currentConversation=${state.conversationId} hadLiveTurn=${hadLiveTurn} bufferLen=${live.buffer.length} ` +
-        `elConnected=${live.el.isConnected}`
-    );
   }
 
   // The extension's text extraction can reshape text already sent as
@@ -603,7 +555,12 @@
   function handleTurnReplace(msg) {
     let live = state.liveTurns.get(msg.turnId);
     if (!live) {
-      // DIAGNOSTIC (bug: two elements for the same index) — see handleTurnDelta.
+      // No matching turn.start (e.g. app restarted mid-stream) — start one
+      // now so the text isn't silently lost. This element gets no index at
+      // all (this message type never carries one), so a later turn.window
+      // for what should be the same message won't find it via
+      // findTurnElementByIndex — a separate, harmless duplicate can result
+      // until the next full history/turn.window resync reconciles it.
       console.log(`[bubble-ui] handleTurnReplace: no live turn for turnId=${msg.turnId} — creating one with NO index.`);
       const el = createTurnElement("assistant");
       insertTurnElement(el, null);
@@ -621,7 +578,12 @@
   function handleTurnEnd(msg) {
     let live = state.liveTurns.get(msg.turnId);
     if (!live) {
-      // DIAGNOSTIC (bug: two elements for the same index) — see handleTurnDelta.
+      // No matching turn.start (e.g. app restarted mid-stream) — start one
+      // now so the text isn't silently lost. This element gets no index at
+      // all (this message type never carries one), so a later turn.window
+      // for what should be the same message won't find it via
+      // findTurnElementByIndex — a separate, harmless duplicate can result
+      // until the next full history/turn.window resync reconciles it.
       console.log(`[bubble-ui] handleTurnEnd: no live turn for turnId=${msg.turnId} — creating one with NO index.`);
       const el = createTurnElement("assistant");
       insertTurnElement(el, null);
@@ -1080,33 +1042,15 @@
         break;
       }
 
-      case "history": {
-        // DIAGNOSTIC (new-message-not-appearing bug, 2026-08-29) — history
-        // is resent on every "conversation" message the server receives,
-        // including a redundant reconnect reannounce to the SAME id (see
-        // server.js's case "conversation") — logged here so a resync that
-        // happens to land mid-reply is visible, not just a real switch.
-        const accepted = event.conversationId === state.conversationId;
-        console.log(
-          `[bubble-ui] history: for=${event.conversationId} current=${state.conversationId} ` +
-            `accepted=${accepted}${accepted ? "" : " (dropped: conversationId mismatch)"} total=${event.total}`
-        );
-        if (!accepted) break;
+      case "history":
+        if (event.conversationId !== state.conversationId) break;
         mergeTurnWindow(indexedMapToArray(event.turns), event.total);
         break;
-      }
 
-      case "turn.window": {
-        const accepted = event.conversationId === state.conversationId;
-        console.log(
-          `[bubble-ui] turn.window: for=${event.conversationId} current=${state.conversationId} ` +
-            `accepted=${accepted}${accepted ? "" : " (dropped: conversationId mismatch)"} ` +
-            `indices=${event.turns.map((t) => t.index).join(",")} total=${event.total}`
-        );
-        if (!accepted) break;
+      case "turn.window":
+        if (event.conversationId !== state.conversationId) break;
         mergeTurnWindow(event.turns, event.total);
         break;
-      }
 
       case "turn.start":
         handleTurnStart(event);
