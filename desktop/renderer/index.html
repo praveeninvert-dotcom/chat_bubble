@@ -8,6 +8,8 @@
 <body>
   <div class="panel">
     <div class="header">
+      <div class="top-corner top-corner-left" id="grip-top-left" title="Drag to resize"></div>
+      <div class="top-corner top-corner-right" id="grip-top-right" title="Drag to resize"></div>
       <div class="header-left">
         <span class="health-dot" id="health-dot" title=""></span>
         <span class="title" id="title-text">Claude</span>
@@ -38,8 +40,7 @@
 
     <div class="message-list" id="message-list">
       <div class="loading-older" id="loading-older" hidden>Loading older messages…</div>
-      <div class="indexed-turns" id="indexed-turns"></div>
-      <div class="live-turns" id="live-turns"></div>
+      <div class="turns" id="turns"></div>
       <div class="empty-state" id="empty-state">No messages yet. Type below to start.</div>
     </div>
 
@@ -58,7 +59,7 @@
       </button>
     </div>
 
-    <div class="settings-overlay" id="settings-overlay" hidden>
+    <div class="settings-overlay" id="settings-overlay">
       <div class="settings-panel">
         <div class="settings-header">
           <span>Settings</span>
@@ -85,6 +86,10 @@
         </div>
       </div>
     </div>
+
+    <div class="resize-grip" id="resize-grip" title="Drag to resize"></div>
+
+    <div class="toast" id="toast" hidden></div>
   </div>
 
   <script src="app.js"></script>

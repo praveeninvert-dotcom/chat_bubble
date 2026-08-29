@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "Claude Session Bubble",
+  "version": "0.1.0",
+  "description": "Bridges one claude.ai conversation to a local desktop bubble window. Personal use only.",
+  "permissions": ["storage"],
+  "host_permissions": ["https://claude.ai/*"],
+  "options_page": "options.html",
+  "content_scripts": [
+    {
+      "matches": ["https://claude.ai/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

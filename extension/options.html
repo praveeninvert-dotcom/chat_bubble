@@ -1,0 +1,51 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Claude Session Bubble — Pairing</title>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+    max-width: 480px;
+    margin: 40px auto;
+    padding: 0 20px;
+    color: #222;
+  }
+  h1 {
+    font-size: 18px;
+  }
+  p {
+    line-height: 1.5;
+  }
+  input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 8px;
+    font-family: monospace;
+    font-size: 13px;
+    margin-bottom: 10px;
+  }
+  button {
+    padding: 8px 16px;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  #status {
+    margin-top: 12px;
+    font-size: 13px;
+    color: #555;
+  }
+</style>
+</head>
+<body>
+  <h1>Claude Session Bubble — Pairing</h1>
+  <p>
+    Open the desktop app's settings panel, copy the pairing token shown
+    there, paste it below, then click Save.
+  </p>
+  <input id="token-input" type="text" placeholder="Paste pairing token here" autocomplete="off" spellcheck="false" />
+  <button id="save-btn">Save</button>
+  <p id="status"></p>
+  <script src="options.js"></script>
+</body>
+</html>

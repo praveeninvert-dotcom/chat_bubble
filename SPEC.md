@@ -188,15 +188,69 @@ more `turn.window` messages.
 { "type": "prompt", "promptId": "<random>", "text": "..." }
 ```
 
+**`retry`** — bubble to extension, over IPC then relayed. Asks the extension to
+retry an assistant reply or resend a user message that's already on the page —
+added for the message-level copy/retry actions.
+```json
+{ "type": "retry", "conversationId": "<id>", "index": 137 }
+```
+The extension locates the row by `data-index`. The transcript is virtualized
+(§4.1) — if the row isn't currently rendered, the extension scrolls it into
+view first, reusing the scroll-container-detection logic §4.1's harvest
+depends on, clicks `[data-testid="action-bar-retry"]` (assistant row) or
+`[data-testid="user-message-retry"]` (user row) — chosen by reading the found
+row's own `data-perf-row`, not by trusting a role the bubble might have sent —
+then restores the original scroll position. If the row can't be found at all,
+the extension sends `error` (`RETRY_FAILED`) rather than doing nothing.
+
+**Assumption, not a confirmed fact:** retrying an assistant reply is assumed to
+replace that reply in place at the same `index`, not append a new row. Under
+that assumption, an in-place text change would otherwise go unnoticed — an
+index already known is exactly what §4.1's scanning treats as "the user
+scrolled," not "new" — so the extension separately watches the retried row's
+`data-perf-row-streaming` (§6) and resends its text as an ordinary
+`turn.window` entry for that index once it settles. If the assumption is
+wrong and claude.ai appends a new row instead, nothing needs to handle it
+specially: a new index is picked up by the normal `turn.start` path exactly
+like any other new message. If indices shift instead, nothing here detects
+that — it would need a full re-harvest to converge, and the general
+multi-step `history.request` harvest itself is not yet implemented (only the
+single-row locate `retry` needs).
+
 **`turn.start`** — extension only.
 ```json
 { "type": "turn.start", "turnId": "<random>", "role": "user" | "assistant",
-  "origin": "bubble" | "native", "promptId": "<id or null>", "ts": 0 }
+  "origin": "bubble" | "native", "promptId": "<id or null>", "ts": 0,
+  "index": 137 }
 ```
+`index` is the row's `data-index` at the moment the turn is first observed —
+the same value `turn.window` carries for the same row (§4.1). Added so the
+bubble can tag a live turn's element with its index as soon as it's known,
+rather than only once a later `turn.window`/harvest happens to cover it —
+`retry` needs a row's index to act on it, and the message just sent or the
+reply just received is the most likely thing to want to retry.
 
 **`turn.delta`** — extension only. Text appended to an in-progress turn.
 ```json
 { "type": "turn.delta", "turnId": "<id>", "text": "chunk" }
+```
+
+**`turn.replace`** — extension only. The full current text for a turnId,
+replacing whatever `turn.delta` had accumulated so far — not an
+optimization, and not safe to remove in favor of always appending.
+**Exists because appending isn't always valid mid-stream:** the extension's
+own text extraction (e.g. code-fence rebuilding) only activates once a
+`<pre>` and its language label are both fully present, which reshapes text
+already sent as deltas. Confirmed 2026-08-28: a live reply logged
+`isAppend=false` with `deltaLen === fullLen` — the text was being rewritten,
+not extended — which without `turn.replace` showed up as the same reply
+appearing three times, each longer than the last. Both the server
+(`pending.buffer`) and the bubble (`live.buffer`) must overwrite on
+`turn.replace`, never append, and must never create a second message for a
+turnId they already know — the same rule `turn.delta`/`turn.end` already
+follow.
+```json
+{ "type": "turn.replace", "turnId": "<id>", "text": "current full text" }
 ```
 
 **`turn.end`** — extension only. `text` is the full final text and is
@@ -230,9 +284,14 @@ disconnects.
 { "type": "peers", "extension": true }
 ```
 
-**`error`**
+**`error`** — sent by the server on a rejected connection (`BAD_TOKEN` |
+`ROLE_TAKEN` | `MALFORMED`), and also relayed as-is from the extension when it
+can't carry out something the bubble asked for — currently just `RETRY_FAILED`
+(see `retry` above). The bubble shows it rather than failing silently.
 ```json
-{ "type": "error", "code": "BAD_TOKEN" | "ROLE_TAKEN" | "MALFORMED", "message": "..." }
+{ "type": "error",
+  "code": "BAD_TOKEN" | "ROLE_TAKEN" | "MALFORMED" | "RETRY_FAILED",
+  "message": "..." }
 ```
 
 ### Rules

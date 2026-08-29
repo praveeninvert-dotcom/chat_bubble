@@ -240,13 +240,20 @@ function createBubbleServer({ userDataDir, getToken, onEvent }) {
           sendError(ws, "MALFORMED", "turn.start needs a turnId.");
           return;
         }
+        // msg.index (added for retry, SPEC.md §4) is the row's real page
+        // index — the same value turn.window uses as its storage key. Using
+        // it here too, instead of only falling back to convo.total the way
+        // this used to, keeps a live turn's storage index consistent with
+        // that same page-index space rather than a separately-incremented
+        // counter that could in principle drift from it.
+        const index = typeof msg.index === "number" ? msg.index : null;
         pendingTurns.set(msg.turnId, {
           role: msg.role,
           origin: msg.origin,
           promptId: msg.promptId || null,
           ts: msg.ts || Date.now(),
           buffer: "",
-          index: null,
+          index,
           flushTimer: null,
         });
         emit({
@@ -256,6 +263,7 @@ function createBubbleServer({ userDataDir, getToken, onEvent }) {
           origin: msg.origin,
           promptId: msg.promptId || null,
           ts: msg.ts,
+          index,
         });
         break;
       }
@@ -273,6 +281,28 @@ function createBubbleServer({ userDataDir, getToken, onEvent }) {
           }
         }
         emit({ type: "turn.delta", turnId: msg.turnId, text: msg.text });
+        break;
+      }
+
+      // Appending isn't always valid mid-stream — the extension's own text
+      // extraction can reshape text already sent as deltas (e.g. code-fence
+      // rebuilding activating once a <pre> and its language label are both
+      // present). turn.replace carries the current full text for a turnId;
+      // unlike turn.delta this OVERWRITES pending.buffer rather than
+      // appending to it. See SPEC.md §4.
+      case "turn.replace": {
+        if (!msg.turnId) {
+          sendError(ws, "MALFORMED", "turn.replace needs a turnId.");
+          return;
+        }
+        const pending = pendingTurns.get(msg.turnId);
+        if (pending) {
+          pending.buffer = msg.text || "";
+          if (!pending.flushTimer) {
+            pending.flushTimer = setTimeout(() => flushPartialTurn(msg.turnId), PARTIAL_FLUSH_MS);
+          }
+        }
+        emit({ type: "turn.replace", turnId: msg.turnId, text: msg.text });
         break;
       }
 
@@ -317,6 +347,16 @@ function createBubbleServer({ userDataDir, getToken, onEvent }) {
         break;
       }
 
+      // The extension sends this itself when it can't carry out something
+      // the bubble asked for (currently just a retry whose row couldn't be
+      // found — RETRY_FAILED, SPEC.md §4) — distinct from sendError() above,
+      // which is the server rejecting a connection. Relayed as-is so the
+      // bubble can show it instead of the failure being silent.
+      case "error": {
+        emit({ type: "error", code: msg.code || "UNKNOWN", message: msg.message || "" });
+        break;
+      }
+
       default:
         console.log("[bubble-server] dropped unrecognised message type:", msg.type);
     }
@@ -333,6 +373,14 @@ function createBubbleServer({ userDataDir, getToken, onEvent }) {
   function sendHistoryRequest(conversationId, beforeIndex) {
     if (!extensionSocket) return false;
     send(extensionSocket, { type: "history.request", conversationId, beforeIndex });
+    return true;
+  }
+
+  // Relay half of SPEC.md §4's retry message — same shape, no server-side
+  // state to track beyond forwarding it.
+  function sendRetry(conversationId, index) {
+    if (!extensionSocket) return false;
+    send(extensionSocket, { type: "retry", conversationId, index });
     return true;
   }
 
@@ -353,7 +401,7 @@ function createBubbleServer({ userDataDir, getToken, onEvent }) {
     console.log(`[bubble-server] listening on ${HOST}:${PORT}`);
   });
 
-  return { sendPrompt, sendHistoryRequest, isExtensionConnected, close };
+  return { sendPrompt, sendHistoryRequest, sendRetry, isExtensionConnected, close };
 }
 
 module.exports = { createBubbleServer, HOST, PORT, MAX_MESSAGE_BYTES };
