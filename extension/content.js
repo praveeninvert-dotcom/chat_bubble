@@ -4,7 +4,9 @@
 // turn.window from the currently-rendered rows, capture health.
 // Part C: streaming (turn.start/delta/end) and full text extraction,
 // including code-fence rebuilding and content placeholders.
-// Sending prompts and history harvesting are Part D.
+// Part D1: prompt injection (a `prompt` message from the bubble goes into
+// the composer and gets sent). Part D2, history harvesting, is not yet
+// built.
 //
 // The text-extraction functions below are pure (no chrome.* / no DOM
 // mutation beyond a hide/restore on the row passed in) so they can be
@@ -385,6 +387,10 @@ if (typeof module !== "undefined" && module.exports) {
       handleRetry(msg);
       return;
     }
+    if (msg.type === "prompt") {
+      handlePrompt(msg);
+      return;
+    }
     log("Received", msg.type, "(handled starting in a later part)");
   }
 
@@ -576,15 +582,23 @@ if (typeof module !== "undefined" && module.exports) {
     send({ type: "conversation", conversationId: state.conversationId, title: state.title });
   }
 
+  // Confirmed signal (SPEC.md §6): a row's data-perf-row-streaming flips to
+  // "false" on completion. Checking for ANY row still "true" is a reliable
+  // global "is Claude currently generating" — used both for the status
+  // message below and by handlePrompt (Part D1) to decide whether it's safe
+  // to send.
+  function isAnyRowStreaming() {
+    const container = document.querySelector('[data-testid="transcript-list"]');
+    return !!(container && container.querySelector('[data-perf-row-streaming="true"]'));
+  }
+
   function sendStatus() {
     const capture = computeCaptureHealth();
     if (capture !== state.lastCapture) {
       log(`Capture health: ${capture}`);
       state.lastCapture = capture;
     }
-    const container = document.querySelector('[data-testid="transcript-list"]');
-    const streaming = !!(container && container.querySelector('[data-perf-row-streaming="true"]'));
-    send({ type: "status", conversationId: state.conversationId, streaming, capture });
+    send({ type: "status", conversationId: state.conversationId, streaming: isAnyRowStreaming(), capture });
   }
 
   // -------------------------------------------------------------------
@@ -873,6 +887,126 @@ if (typeof module !== "undefined" && module.exports) {
     handlePossibleConversationChange();
     attachRowObserver();
     reconcileLiveTurns();
+  }
+
+  // -------------------------------------------------------------------
+  // Part D1: prompt injection (SPEC.md §4's `prompt` message)
+  // -------------------------------------------------------------------
+
+  // Reuses the composer/send-button facts SELECTORS.md already recorded
+  // (D1-D3) instead of guessing at TipTap's empty-document DOM shape: the
+  // send button's disabled state already distinguishes "composer empty"
+  // from "composer has content." Checking it BEFORE inserting anything
+  // doubles as "does the operator already have unsent text typed in here" —
+  // no new selector needed.
+  function isComposerEmpty() {
+    const sendBtn = document.querySelector('[data-testid="chat-input-send"]');
+    return !sendBtn || sendBtn.disabled === true;
+  }
+
+  // Handles a relayed `prompt` (SPEC.md §4): focus the composer, insert the
+  // text, confirm the send button actually enabled, click it, and remember
+  // the promptId so the resulting user turn is tagged origin:"bubble"
+  // instead of "native" (see startLiveTurn/consumePendingPromptId — that's
+  // what stops the bubble showing the message twice).
+  //
+  // claude.ai/new needs no special case: it uses the same
+  // [data-testid="chat-input"] / [data-testid="chat-input-send"] composer as
+  // an existing conversation (SELECTORS.md), and sending from it is exactly
+  // what transitions the URL to /chat/<id> — handlePossibleConversationChange
+  // (Part B) picks that up on its own poll tick.
+  //
+  // Two cases are refused rather than guessed through, both reported back as
+  // an `error` so the bubble shows something instead of silently doing
+  // nothing:
+  //
+  // 1. Claude is already generating a reply. SELECTORS.md's D3 discovery
+  //    step (find the send/stop control) was never completed with a
+  //    recorded fact about what [data-testid="chat-input-send"] turns into
+  //    while streaming — whether it becomes a stop button under the same
+  //    testid, changes aria-label, or something else entirely. Clicking it
+  //    blindly here risks interrupting the in-progress reply instead of
+  //    sending a new one. data-perf-row-streaming (SPEC.md §6, confirmed) is
+  //    used instead — it says "Claude is busy" without touching that
+  //    unconfirmed ground.
+  // 2. The composer already has text the operator typed by hand into
+  //    claude.ai directly. Overwriting or appending to it would silently
+  //    destroy that. Refusing and telling the operator to send or clear it
+  //    first is the boring, safe option — no attempt to merge or stash it.
+  //
+  // Both are reported with the same code (PROMPT_BUSY): from the operator's
+  // side, both mean the same thing — "try again in a moment," not a bug.
+  async function handlePrompt(msg) {
+    if (!msg || typeof msg.text !== "string" || !msg.promptId) {
+      send({ type: "error", code: "PROMPT_FAILED", message: "Prompt message was missing text or a promptId." });
+      return;
+    }
+    log(`prompt: received promptId=${msg.promptId}, length=${msg.text.length}`);
+
+    const composer = document.querySelector('[data-testid="chat-input"]');
+    if (!composer) {
+      send({
+        type: "error",
+        code: "PROMPT_FAILED",
+        message: "Composer not found on the page — not on a claude.ai chat page, or the layout changed.",
+      });
+      return;
+    }
+
+    if (isAnyRowStreaming()) {
+      log("prompt: refused — Claude is currently generating a reply.");
+      send({
+        type: "error",
+        code: "PROMPT_BUSY",
+        message: "Claude is still responding. Wait for it to finish, then send again.",
+      });
+      return;
+    }
+
+    if (!isComposerEmpty()) {
+      log("prompt: refused — composer already has text.");
+      send({
+        type: "error",
+        code: "PROMPT_BUSY",
+        message: "The composer already has text typed into it. Send or clear that first, then try again.",
+      });
+      return;
+    }
+
+    composer.focus();
+    const inserted = document.execCommand("insertText", false, msg.text);
+    if (!inserted) {
+      send({
+        type: "error",
+        code: "PROMPT_FAILED",
+        message: "execCommand('insertText') returned false — injection did not work.",
+      });
+      return;
+    }
+
+    // The proof that matters (SELECTORS.md): TipTap accepted the text into
+    // its own document model rather than the characters merely being
+    // painted on screen. If this doesn't flip, report instead of clicking
+    // blindly — clicking a button still reading "disabled" wouldn't send
+    // anything, but silently doing nothing is worse than saying so.
+    const sendBtn = document.querySelector('[data-testid="chat-input-send"]');
+    if (!sendBtn) {
+      send({ type: "error", code: "PROMPT_FAILED", message: "Send button not found after inserting text." });
+      return;
+    }
+    if (sendBtn.disabled !== false) {
+      log(`prompt: send button did not enable after injection (disabled=${sendBtn.disabled}).`);
+      send({
+        type: "error",
+        code: "PROMPT_FAILED",
+        message: "Text was inserted but the send button did not enable — not sending.",
+      });
+      return;
+    }
+
+    state.pendingPromptId = msg.promptId;
+    sendBtn.click();
+    log(`prompt: sent promptId=${msg.promptId}.`);
   }
 
   // -------------------------------------------------------------------

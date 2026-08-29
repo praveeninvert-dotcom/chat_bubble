@@ -187,6 +187,26 @@ more `turn.window` messages.
 ```json
 { "type": "prompt", "promptId": "<random>", "text": "..." }
 ```
+The extension focuses the composer, inserts the text with
+`execCommand('insertText')`, confirms the send button actually enabled, then
+clicks it — never blindly. `pendingPromptId` is set right before the click so
+the resulting user turn is tagged `origin: "bubble"` with this `promptId`
+(§4's echo handling).
+
+Two cases are refused rather than acted on, both reported back as `error`
+(`PROMPT_BUSY`):
+1. **Claude is already generating a reply**, detected via
+   `data-perf-row-streaming` (§6) rather than the send button's own state —
+   whether that button turns into a stop control while streaming was never
+   confirmed (SELECTORS.md's D3), so clicking it blindly could interrupt the
+   reply in progress instead of sending a new one.
+2. **The composer already has text the operator typed by hand.** Overwriting
+   or appending to it would silently destroy it. The operator is asked to
+   send or clear it first — nothing is stashed or merged.
+
+If text is inserted but the send button never enables, or the composer/send
+button can't be found at all, the extension reports `PROMPT_FAILED` instead
+of clicking blindly.
 
 **`retry`** — bubble to extension, over IPC then relayed. Asks the extension to
 retry an assistant reply or resend a user message that's already on the page —
@@ -309,11 +329,13 @@ disconnects.
 
 **`error`** — sent by the server on a rejected connection (`BAD_TOKEN` |
 `ROLE_TAKEN` | `MALFORMED`), and also relayed as-is from the extension when it
-can't carry out something the bubble asked for — currently just `RETRY_FAILED`
-(see `retry` above). The bubble shows it rather than failing silently.
+can't carry out something the bubble asked for — `RETRY_FAILED` (see `retry`
+above), or `PROMPT_BUSY` / `PROMPT_FAILED` (see `prompt` above). The bubble
+shows it rather than failing silently.
 ```json
 { "type": "error",
-  "code": "BAD_TOKEN" | "ROLE_TAKEN" | "MALFORMED" | "RETRY_FAILED",
+  "code": "BAD_TOKEN" | "ROLE_TAKEN" | "MALFORMED" | "RETRY_FAILED" |
+          "PROMPT_BUSY" | "PROMPT_FAILED",
   "message": "..." }
 ```
 
