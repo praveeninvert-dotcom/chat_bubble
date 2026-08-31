@@ -851,14 +851,6 @@ if (typeof module !== "undefined" && module.exports) {
   }
 
   function sendConversation() {
-    // DIAGNOSTIC (conversation-switch bug, step 1) — confirms both that this
-    // ran and whether the socket was actually open to receive it: send()
-    // silently no-ops when the socket isn't OPEN, with no retry, so
-    // "detected the switch" and "delivered it" are different questions.
-    log(
-      `Sending conversation: id=${state.conversationId} title=${JSON.stringify(state.title)} ` +
-        `socketOpen=${!!(socket && socket.readyState === WebSocket.OPEN)}`
-    );
     send({ type: "conversation", conversationId: state.conversationId, title: state.title });
   }
 
@@ -920,13 +912,6 @@ if (typeof module !== "undefined" && module.exports) {
     // rewritten out from under it. See SPEC.md §4.
     const isAppend = fullText.startsWith(liveTurn.lastText);
     const delta = isAppend ? fullText.slice(liveTurn.lastText.length) : fullText;
-    // DIAGNOSTIC (2026-08-28, tracking the duplicate-bubble bug) — keep in
-    // for now per operator request.
-    log(
-      `turn.delta diagnostic: turnId=${liveTurn.turnId} isAppend=${isAppend} ` +
-        `prevLen=${liveTurn.lastText.length} fullLen=${fullText.length} deltaLen=${delta.length} ` +
-        `sentAs=${isAppend ? "turn.delta" : "turn.replace"}`
-    );
     liveTurn.lastText = fullText;
     if (isAppend) {
       if (delta) {
@@ -999,11 +984,6 @@ if (typeof module !== "undefined" && module.exports) {
     const promptId = role === "user" ? consumePendingPromptId() : null;
     const origin = promptId ? "bubble" : "native";
 
-    // DIAGNOSTIC (2026-08-28, tracking the duplicate-bubble bug) — remove
-    // once resolved. If this fires more than once for what should be a
-    // single reply, the row's index isn't being recognised as "already
-    // known" between scans.
-    log(`turn.start diagnostic: turnId=${turnId} role=${role} index=${idx}`);
     // index is the same data-index value turn.window carries for this row
     // (SPEC.md §4) — included so the bubble can tag the element with it as
     // soon as the turn starts, rather than waiting for a turn.window/harvest
@@ -1407,11 +1387,12 @@ if (typeof module !== "undefined" && module.exports) {
     return list.querySelector(`[data-testid="transcript-row"][data-index="${index}"]`);
   }
 
-  // Debug-only: a cheap read of which indices are currently rendered, for
-  // the diagnostic logging below. Deliberately not collectWindow()/parseRow
-  // — those call extractRowText, which does its own DOM manipulation
-  // (hide/restore, marker insert/remove) on every row, which is wasted work
-  // and an unwanted side effect just to log a list of numbers.
+  // A cheap read of which indices are currently rendered — used by the
+  // history harvest below to detect progress, and by withRowInView's retry
+  // path. Deliberately not collectWindow()/parseRow — those call
+  // extractRowText, which does its own DOM manipulation (hide/restore,
+  // marker insert/remove) on every row, which would be wasted work and an
+  // unwanted side effect just to read a list of numbers.
   function renderedIndices() {
     const list = document.querySelector('[data-testid="transcript-list"]');
     if (!list) return [];
@@ -1438,23 +1419,13 @@ if (typeof module !== "undefined" && module.exports) {
   // restores the original scroll position regardless of outcome — the
   // claude.ai tab is normally in the background, but SPEC.md §4.1 says to
   // restore either way in case it isn't.
-  //
-  // DIAGNOSTIC (bug: retry reported "couldn't find message 17" even though
-  // a turn.start log showed that index existing) — logs what's rendered at
-  // each decision point so a real failure can be told apart from a stale
-  // assumption about what's in the DOM. Kept in until that's resolved.
   async function withRowInView(index, fn) {
-    log(`retry: looking for index=${index}. Currently rendered: [${renderedIndices().join(", ")}]`);
-
     let row = findRowByIndex(index);
-    if (row) {
-      log(`retry: index=${index} was already rendered, no scroll needed.`);
-      return fn(row);
-    }
+    if (row) return fn(row);
 
     const scroller = findScrollContainer();
     if (!scroller) {
-      log(`retry: index=${index} not rendered and no scroll container found (nothing scrollable, or transcript-list missing).`);
+      log(`retry: index=${index} not rendered and no scroll container found.`);
       return fn(null);
     }
 
@@ -1469,21 +1440,14 @@ if (typeof module !== "undefined" && module.exports) {
     const collected = collectWindow();
     const total = collected && collected.total ? collected.total : null;
     const target = estimateScrollTopForIndex(scroller, index, total);
-    log(
-      `retry: index=${index} not rendered, scrolling. total=${total} scrollHeight=${scroller.scrollHeight} ` +
-        `clientHeight=${scroller.clientHeight} originalScrollTop=${originalScrollTop} -> target=${target}`
-    );
     scroller.scrollTop = target;
     await wait();
     row = findRowByIndex(index);
-    log(`retry: after first scroll, rendered: [${renderedIndices().join(", ")}] — found=${!!row}`);
 
     if (!row) {
-      log(`retry: index=${index} still not found, falling back to scrollTop=0.`);
       scroller.scrollTop = 0;
       await wait();
       row = findRowByIndex(index);
-      log(`retry: after fallback scroll, rendered: [${renderedIndices().join(", ")}] — found=${!!row}`);
     }
 
     try {
@@ -1561,32 +1525,7 @@ if (typeof module !== "undefined" && module.exports) {
       // bubble sent — the row we actually found is the only source of truth
       // for which action applies to it.
       const role = row.getAttribute("data-perf-row");
-
-      // DIAGNOSTIC (bug: the interrupted-response branch below wasn't
-      // being reached, or wasn't matching — unclear which from the log
-      // alone) — logs the match result BOTH ways, not just on success, plus
-      // enough of the actual row text to catch an encoding mismatch (a
-      // typographic apostrophe, a non-breaking space instead of a regular
-      // one, different wording) that a plain string comparison would fail
-      // on silently. row.textContent is used here (not extractRowText),
-      // so this can include hidden accessibility text before the visible
-      // notice — the window below is centered on wherever "interrupted"
-      // itself appears, not just the start of the string, so it's not
-      // buried in unrelated leading text. Remove once resolved.
-      const rowTextLower = row.textContent.toLowerCase();
-      const isInterrupted = rowTextLower.includes(INTERRUPTED_RESPONSE_TEXT);
-      const interruptedWordIdx = rowTextLower.indexOf("interrupted");
-      const windowStart = interruptedWordIdx === -1 ? 0 : Math.max(0, interruptedWordIdx - 20);
-      const windowText =
-        interruptedWordIdx === -1 ? row.textContent.slice(0, 60) : row.textContent.slice(windowStart, windowStart + 60);
-      log(
-        `retry: interrupted-notice check for index=${msg.index}: matched=${isInterrupted}, ` +
-          `constant=${JSON.stringify(INTERRUPTED_RESPONSE_TEXT)}, ` +
-          `"interrupted" found at char ${interruptedWordIdx} of ${row.textContent.length} in row.textContent. ` +
-          `Text around there: ${JSON.stringify(windowText)}, char codes: [${Array.from(windowText)
-            .map((c) => c.codePointAt(0))
-            .join(",")}]`
-      );
+      const isInterrupted = row.textContent.toLowerCase().includes(INTERRUPTED_RESPONSE_TEXT);
 
       if (isInterrupted) {
         interruptedResponse = true;
@@ -1607,12 +1546,6 @@ if (typeof module !== "undefined" && module.exports) {
         log(`retry: row for index=${msg.index} is an interrupted response — found ${candidates.length} "Try again" button(s).`);
         if (candidates.length !== 1) return false;
         candidates[0].click();
-        // DIAGNOSTIC (bug: watchRetriedRow not observed firing on this
-        // path) — the call is gated on role, read from data-perf-row
-        // above; this confirms what that actually evaluated to, in case
-        // an interrupted row's data-perf-row differs from a normal
-        // assistant row's. Remove once resolved.
-        log(`retry: about to check role for watchRetriedRow gate, role=${JSON.stringify(role)}`);
         if (role === "assistant") watchRetriedRow(row);
         return true;
       }
@@ -1684,34 +1617,27 @@ if (typeof module !== "undefined" && module.exports) {
   // the bubble already has, one virtualizer window at a time. The estimate
   // jump is what keeps "do not harvest more than asked" from also meaning
   // "and take forever getting there."
-  // 2026-08-29, operator-reported bug: harvest indicator showed "20 of 281
-  // loaded" and just sat there for a while, only actually loading anything
-  // once the operator switched to the claude.ai tab and scrolled it by
-  // hand. Two live candidates were identified, not yet distinguished at the
-  // time:
+  // OPEN BUG, 2026-08-29: harvest indicator showed "20 of 281 loaded" and
+  // just sat there for a while, only actually loading anything once the
+  // operator switched to the claude.ai tab and scrolled it by hand. Two
+  // candidates, not yet distinguished:
   //   1. The claude.ai tab is normally BACKGROUNDED while the bubble is
   //      used (the whole point of this project) — Chrome throttles
-  //      background-tab timers, both setTimeout directly and, separately,
-  //      requestAnimationFrame (which a virtualizer may use internally to
-  //      batch a re-render after a scroll event). The old fixed
-  //      SCROLL_SETTLE_MS wait could be taking far longer than 1200ms in
-  //      practice, or never firing until the tab is foregrounded.
+  //      background-tab timers and requestAnimationFrame, which a
+  //      virtualizer may depend on to re-render after a scroll event.
   //   2. Setting scroller.scrollTop programmatically might not be producing
-  //      a real "scroll" event the way a physical wheel/trackpad scroll
-  //      does — or produces one the virtualizer doesn't act on the same way.
-  // 2026-08-30: candidate 1 is now addressed structurally — the fixed wait
-  // below is replaced by waitForIndicesChange, which resolves as soon as
-  // the DOM actually shows new rows instead of guessing a duration, so
-  // timer/rAF throttling can no longer cause a wait to end before the
-  // virtualizer has actually responded. This has NOT yet been confirmed
-  // against a genuinely backgrounded tab (the original diagnostic run
+  //      a real "scroll" event the way physical wheel/trackpad input does —
+  //      or produces one the virtualizer doesn't act on the same way.
+  // 2026-08-30: candidate 1 is partially addressed — the fixed wait below
+  // was replaced by waitForIndicesChange, which resolves as soon as the DOM
+  // actually shows new rows instead of guessing a duration. This has NOT
+  // been confirmed against a genuinely backgrounded tab (the original run
   // showed visibilityState=visible throughout, so candidate 1 was always an
-  // inference, not a confirmed cause) — the logging below (elapsed time,
-  // visibilityState, changed/timed-out) is what the next backgrounded test
-  // run should check to confirm or kill it. Candidate 2's own diagnostics
-  // (onDiagnosticScroll/onDiagnosticVisibility, and the wheel/touchstart
-  // interference listeners below, which are unrelated — those detect
-  // genuine operator input, not this) are unchanged.
+  // inference). The next investigation should reproduce with the claude.ai
+  // tab actually backgrounded and check the reason/steps logged in
+  // handleHistoryRequest's `finally` block below — reintroduce timing/
+  // visibilityState logging around the waitForIndicesChange calls if that's
+  // not enough to tell the two candidates apart.
   const realNow = () => Date.now();
 
   // Generous ceiling for how long ONE step waits for the virtualizer to
@@ -1814,32 +1740,6 @@ if (typeof module !== "undefined" && module.exports) {
 
     const originalScrollTop = scroller.scrollTop;
 
-    // DIAGNOSTIC — candidate 2 (see above): does OUR OWN scrollTop
-    // assignment ever produce a real "scroll" event on this container, and
-    // when relative to when we set it? Diagnostic-only: never sets
-    // userInterfered, unlike the wheel/touchstart listeners below.
-    let scrollEventCount = 0;
-    const onDiagnosticScroll = () => {
-      scrollEventCount++;
-      log(
-        `history DIAGNOSTIC: native "scroll" event #${scrollEventCount} on the container, t=${realNow()}, ` +
-          `scrollTop=${scroller.scrollTop}, document.visibilityState=${document.visibilityState}`
-      );
-    };
-    scroller.addEventListener("scroll", onDiagnosticScroll, { passive: true });
-
-    // DIAGNOSTIC — candidate 1: did the tab change foreground/background
-    // state partway through, and when relative to the steps around it?
-    const onDiagnosticVisibility = () => {
-      log(`history DIAGNOSTIC: document.visibilitychange -> ${document.visibilityState}, t=${realNow()}`);
-    };
-    document.addEventListener("visibilitychange", onDiagnosticVisibility);
-
-    log(
-      `history DIAGNOSTIC: harvest starting, t=${realNow()}, document.visibilityState=${document.visibilityState}, ` +
-        `document.hidden=${document.hidden}`
-    );
-
     // Genuine user input (wheel/touch) during the harvest is the signal to
     // back off — per-instruction, abort and restore rather than fighting
     // the operator for control of the scroll position. Setting
@@ -1868,26 +1768,9 @@ if (typeof module !== "undefined" && module.exports) {
           `originalScrollTop=${originalScrollTop} -> target=${initialTarget}`
       );
 
-      // Elapsed real time and visibilityState for the initial jump's wait,
-      // so a genuinely-backgrounded test run can confirm or kill the
-      // rAF/timer-throttling theory (see the comment above realNow, above).
       const indicesBeforeJump = renderedIndices();
-      const scrollEventsBeforeJump = scrollEventCount;
-      const tBeforeJump = realNow();
-      const visBeforeJump = document.visibilityState;
       scroller.scrollTop = initialTarget;
-      log(
-        `history: set scrollTop=${initialTarget}, readback=${scroller.scrollTop}, ` +
-          `visibilityState=${visBeforeJump}, t=${tBeforeJump}`
-      );
-      const jumpChanged = await waitForIndicesChange(indicesBeforeJump.join(","), HARVEST_STEP_SETTLE_TIMEOUT_MS);
-      const tAfterJump = realNow();
-      log(
-        `history: initial jump settle — changed=${jumpChanged}, elapsed=${tAfterJump - tBeforeJump}ms ` +
-          `(ceiling ${HARVEST_STEP_SETTLE_TIMEOUT_MS}ms), scrollEventsDuringWait=${scrollEventCount - scrollEventsBeforeJump}, ` +
-          `indicesBefore=[${indicesBeforeJump.join(",")}] indicesAfter=[${renderedIndices().join(",")}], ` +
-          `visibilityState ${visBeforeJump} -> ${document.visibilityState}`
-      );
+      await waitForIndicesChange(indicesBeforeJump.join(","), HARVEST_STEP_SETTLE_TIMEOUT_MS);
 
       while (reason === null) {
         steps++;
@@ -1934,43 +1817,18 @@ if (typeof module !== "undefined" && module.exports) {
         }
         lastIndicesKey = indicesKey;
 
-        // Real DOM-signal wait (waitForIndicesChange), not a blind timeout —
-        // still logged with elapsed time + visibilityState so a
-        // genuinely-backgrounded test run can confirm or kill the
-        // rAF/timer-throttling theory; scrollEventCount is still tracked
-        // for the separate "does our own scrollTop assignment even fire a
-        // scroll event" question.
-        const scrollTopBeforeStep = scroller.scrollTop;
-        const scrollEventsBeforeStep = scrollEventCount;
-        const tBeforeStep = realNow();
-        const visBeforeStep = document.visibilityState;
         if (scroller.scrollTop > 0) {
           scroller.scrollTop = Math.max(0, scroller.scrollTop - scroller.clientHeight);
-          log(
-            `history: step ${steps} set scrollTop ${scrollTopBeforeStep} -> readback=${scroller.scrollTop}, ` +
-              `visibilityState=${visBeforeStep}, t=${tBeforeStep}`
-          );
-          const stepChanged = await waitForIndicesChange(indicesKey, HARVEST_STEP_SETTLE_TIMEOUT_MS);
-          const tAfterStep = realNow();
-          log(
-            `history: step ${steps} settle — changed=${stepChanged}, elapsed=${tAfterStep - tBeforeStep}ms ` +
-              `(ceiling ${HARVEST_STEP_SETTLE_TIMEOUT_MS}ms), scrollEventsDuringWait=${scrollEventCount - scrollEventsBeforeStep}, ` +
-              `indicesBefore=[${indices.join(",")}] indicesAfter=[${renderedIndices().join(",")}], ` +
-              `visibilityState ${visBeforeStep} -> ${document.visibilityState}`
-          );
-        } else {
-          log(`history: step ${steps} — scrollTop already 0, nothing further to scroll this step.`);
+          await waitForIndicesChange(indicesKey, HARVEST_STEP_SETTLE_TIMEOUT_MS);
         }
       }
     } finally {
       scroller.removeEventListener("wheel", markInterference);
       scroller.removeEventListener("touchstart", markInterference);
-      scroller.removeEventListener("scroll", onDiagnosticScroll);
-      document.removeEventListener("visibilitychange", onDiagnosticVisibility);
       scroller.scrollTop = originalScrollTop;
       log(
         `history: finished — reason=${reason || "unknown"}, steps=${steps}, restored scrollTop=${originalScrollTop}, ` +
-          `t=${realNow()}, totalScrollEvents=${scrollEventCount}`
+          `t=${realNow()}, visibilityState=${document.visibilityState}`
       );
       historyHarvestInFlight = false;
       currentHarvestBeforeIndex = null;

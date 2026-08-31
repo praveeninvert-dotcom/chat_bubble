@@ -216,7 +216,7 @@ app.whenReady().then(() => {
   const userDataDir = app.getPath("userData");
   token = getOrCreateToken(userDataDir);
   console.log("[bubble-server] userData dir:", userDataDir);
-  console.log("[bubble-server] pairing token:", token);
+  console.log("[bubble-server] pairing token loaded — see the Settings panel to view or copy it.");
 
   server = createBubbleServer({
     userDataDir,
@@ -318,7 +318,7 @@ ipcMain.handle("bubble:get-token", () => token);
 
 ipcMain.handle("bubble:regenerate-token", () => {
   token = regenerateToken(app.getPath("userData"));
-  console.log("[bubble-server] pairing token regenerated:", token);
+  console.log("[bubble-server] pairing token regenerated — see the Settings panel to view or copy it.");
   return token;
 });
 

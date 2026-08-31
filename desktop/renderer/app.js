@@ -513,7 +513,6 @@
     // produced — force: true so a genuinely empty reply still clears the
     // loading dots (see paintTurn) instead of leaving them stuck forever.
     paintTurn(live.el, live.el.className.includes("turn-user") ? "user" : "assistant", msg.text, { force: true });
-    state.total += 1;
     updateHistoryBadge();
     updateEmptyState();
     if (!state.userScrolledUp) scrollToBottom();
@@ -972,14 +971,7 @@
         break;
 
       case "conversation": {
-        // DIAGNOSTIC (conversation-switch bug, step 3) — confirms the event
-        // actually reached the bubble and whether it decided to reset.
-        const willReset = event.conversationId !== state.conversationId;
-        console.log(
-          `[bubble-ui] conversation event: incoming=${event.conversationId} ` +
-            `current=${state.conversationId} willReset=${willReset}`
-        );
-        if (willReset) {
+        if (event.conversationId !== state.conversationId) {
           resetConversationState(event.conversationId, event.title);
         } else {
           // Same conversation, a title-only follow-up — the extension sends

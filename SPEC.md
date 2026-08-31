@@ -295,6 +295,29 @@ row's own `data-perf-row`, not by trusting a role the bubble might have sent —
 then restores the original scroll position. If the row can't be found at all,
 the extension sends `error` (`RETRY_FAILED`) rather than doing nothing.
 
+**Interrupted responses are a separate case.** A reply the operator stopped, or
+that stopped itself, doesn't render the normal action bar at all — instead the
+row shows an inline notice ("Claude's response was interrupted.") with two
+buttons, "Edit prompt" and "Try again", neither carrying a `data-testid` or any
+other distinguishing attribute. `handleRetry` first checks the row's text for
+the interrupted notice; if found, it locates "Try again" by exact button text
+instead of the normal selector, and clicks it **only** when that text match
+yields exactly one candidate on the row — zero (wording changed) or two
+(shouldn't happen) both report `RETRY_FAILED` rather than guess, since guessing
+wrong could click "Edit prompt" and put the page into an edit state the
+operator didn't ask for. This text match is the most fragile selector in the
+project — see SELECTORS.md's "Interrupted-response 'Try again' button" section
+before touching it, and check there first if retrying an interrupted response
+ever stops working.
+
+Whichever path clicks a retry button, the extension then calls
+`watchRetriedRow` on an assistant row: since the row's `index` is already
+"known" (§4.1 treats a known index as "the user scrolled," not "new"), an
+in-place text change from a retry would otherwise never be observed. It
+watches the row's `data-perf-row-streaming` for the flip to `"false"` (§6),
+then resends the row's current text as an ordinary `turn.window` entry for
+that index.
+
 **Assumption, not a confirmed fact:** retrying an assistant reply is assumed to
 replace that reply in place at the same `index`, not append a new row. Under
 that assumption, an in-place text change would otherwise go unnoticed — an
