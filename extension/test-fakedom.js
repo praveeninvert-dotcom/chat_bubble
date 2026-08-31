@@ -7,10 +7,12 @@
 //
 // Deliberately NOT a general DOM/HTML-parser implementation — it supports
 // exactly the selector grammar content.js's own selector constants use
-// (bare tag, tag.class, tag[attr="value"], [attr="value"], comma-separated
-// lists, and the one two-token descendant combinator content.js needs,
-// "pre button") and nothing more; an unsupported selector throws rather
-// than silently matching nothing. innerText is approximated as
+// (bare tag, tag.class, tag[attr="value"], [attr="value"], one or more
+// chained attribute selectors on the same token e.g.
+// [role="toolbar"][aria-label="x"], comma-separated lists, and the one
+// two-token descendant combinator content.js needs, "pre button") and
+// nothing more; an unsupported selector throws rather than silently
+// matching nothing. innerText is approximated as
 // textContent — real <pre>/innerText whitespace fidelity is a
 // browser-only behaviour already covered by content.test.js's separate,
 // pure insertCodeFences tests, not by anything built here.
@@ -41,6 +43,10 @@ class FakeElement {
 
   get children() {
     return this.childNodes.filter((n) => n.nodeType === ELEMENT_NODE);
+  }
+
+  get parentElement() {
+    return this.parent || null;
   }
 
   get textContent() {
@@ -83,14 +89,21 @@ class FakeElement {
   }
 }
 
-// Matches "tag", "tag.class", "tag[attr=\"value\"]", or "[attr=\"value\"]"
-// against a single element — no combinators here, see matchesCombinator.
+// Matches "tag", "tag.class", "tag[attr=\"value\"]", "[attr=\"value\"]", or
+// one token carrying multiple chained attribute selectors (e.g.
+// "[role=\"toolbar\"][aria-label=\"x\"]", optionally tag-prefixed) — no
+// combinators here, see matchesCombinator.
 function matchesSimple(el, simple) {
-  const attrMatch = simple.match(/^([a-zA-Z0-9]*)\[([a-zA-Z0-9-]+)="([^"]*)"\]$/);
-  if (attrMatch) {
-    const [, tag, attr, value] = attrMatch;
+  const attrsMatch = simple.match(/^([a-zA-Z0-9]*)((?:\[[a-zA-Z0-9-]+="[^"]*"\])+)$/);
+  if (attrsMatch) {
+    const [, tag, attrsPart] = attrsMatch;
     if (tag && el.tagName !== tag.toUpperCase()) return false;
-    return el.getAttribute(attr) === value;
+    const attrRe = /\[([a-zA-Z0-9-]+)="([^"]*)"\]/g;
+    let m;
+    while ((m = attrRe.exec(attrsPart))) {
+      if (el.getAttribute(m[1]) !== m[2]) return false;
+    }
+    return true;
   }
   const classMatch = simple.match(/^([a-zA-Z0-9]+)\.([a-zA-Z0-9-]+)$/);
   if (classMatch) {
@@ -102,10 +115,33 @@ function matchesSimple(el, simple) {
   throw new Error(`test-fakedom: unsupported selector fragment "${simple}"`);
 }
 
+// Splits a combinator on whitespace, except whitespace inside a quoted
+// attribute value — needed now that content.js has a selector whose
+// attribute value itself contains a space (aria-label="Message actions"),
+// which a naive split(/\s+/) would wrongly cut in two.
+function splitCombinatorParts(combinator) {
+  const parts = [];
+  let current = "";
+  let inQuotes = false;
+  for (const ch of combinator) {
+    if (ch === '"') inQuotes = !inQuotes;
+    if (/\s/.test(ch) && !inQuotes) {
+      if (current) {
+        parts.push(current);
+        current = "";
+      }
+    } else {
+      current += ch;
+    }
+  }
+  if (current) parts.push(current);
+  return parts;
+}
+
 // Supports a bare simple selector, or the one two-token descendant
 // combinator content.js's own selectors use ("pre button").
 function matchesCombinator(el, combinator) {
-  const parts = combinator.split(/\s+/).filter(Boolean);
+  const parts = splitCombinatorParts(combinator);
   if (parts.length === 1) return matchesSimple(el, parts[0]);
   if (parts.length === 2) {
     if (!matchesSimple(el, parts[1])) return false;

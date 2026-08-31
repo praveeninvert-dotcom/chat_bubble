@@ -60,33 +60,46 @@ function cleanText(raw) {
   return text.trim();
 }
 
-// Per-message controls (copy/retry/thumbs/read-aloud/edit) render as text
-// inside the row and leak into innerText as garbage. Hiding the actual live
-// elements — not a detached clone — and restoring them synchronously
-// (nothing repaints in between) keeps innerText's layout-aware behaviour,
-// which a clone removed from the document would lose: innerText on a
-// detached node falls back to textContent, which is exactly the
-// code-formatting-destroying behaviour SPEC.md §7 ruled out.
-const EXCLUDED_CONTROL_SELECTORS = [
-  '[data-testid="action-bar-copy"]',
-  '[data-testid="action-bar-retry"]',
-  '[data-testid="action-bar-thumbs-up"]',
-  '[data-testid="action-bar-thumbs-down"]',
-  '[data-testid="action-bar-read-aloud"]',
-  '[data-testid="user-message-retry"]',
-  '[data-testid="user-message-edit"]',
-  '[data-testid="user-message-copy"]',
-].join(",");
-
-// Confirmed 2026-08-28: the relative-timestamp element itself.
-const TIMESTAMP_SELECTOR = 'time[data-cds="RelativeTime"]';
+// Confirmed 2026-08-31: every per-message control (copy/retry/thumbs/
+// read-aloud/edit), the relative timestamp, and — as of this date — the
+// "N / N" retry-variant counter all live inside one container:
+// <div data-cds="MessageActions" data-reveal="fade" role="toolbar"
+//      aria-label="Message actions" data-size="xs" tabindex="-1"
+//      class="flex items-center select-none ...">
+// Confirmed by discovery script: this container's own text content is only
+// whitespace plus the timestamp (19 chars vs 204 for the whole row) — it
+// holds nothing but the toolbar. This replaces five separate per-element
+// exclusions (each found individually, on five separate occasions, by the
+// operator spotting a fresh leak in the bubble) with one container
+// exclusion: whatever renders inside this toolbar in the future — a new
+// button, a new pill, anything — is now excluded automatically, without
+// needing to be spotted and patched one at a time again. Two independent
+// selectors are combined so either surviving a redesign alone still works:
+// `data-cds="MessageActions"` and `role="toolbar"[aria-label="Message
+// actions"]` are unrelated attributes (a11y vs. internal component
+// tagging), not two names for the same fact, so it's very unlikely a single
+// styling/refactor pass drops both at once. This subsumes the former
+// EXCLUDED_CONTROL_SELECTORS (action-bar-copy/retry/thumbs-up/thumbs-down/
+// read-aloud, user-message-retry/edit/copy), TIMESTAMP_SELECTOR, and the
+// retry-counter class-fingerprint match — all deleted below in favor of
+// this one container. Elements are skipped by object identity during the
+// DOM walk (see collectExclusions/renderBlocksDom/renderInlineDom), so
+// adding the container itself to the skip set is enough to skip its entire
+// subtree — no need to also enumerate what's inside it.
+//
+// h2.sr-only (the accessibility preview), the tool-status pill/spark/caret,
+// and icon glyphs are NOT covered by this container — confirmed or left
+// unconfirmed as noted at each one below — and keep their own selectors.
+const MESSAGE_ACTIONS_SELECTOR = '[data-cds="MessageActions"], [role="toolbar"][aria-label="Message actions"]';
 
 // Confirmed 2026-08-28: <h2 data-find-omitted="" class="sr-only select-none">
 // You said: <preview></h2> — the screen-reader-only announcement holding
 // both the "Claude responded: " / "You said: " prefix and the (sometimes
 // paraphrased) preview described above. Scoped to h2.sr-only rather than a
 // bare .sr-only in case that utility class is reused elsewhere for
-// something that should stay.
+// something that should stay. Confirmed 2026-08-31 to sit OUTSIDE the
+// MessageActions toolbar (it's a heading over the whole row, not a toolbar
+// control), so it keeps its own selector rather than being subsumed.
 const ACCESSIBILITY_PREVIEW_SELECTOR = "h2.sr-only";
 
 // Tool/MCP status UI (a connecting/searching pill with a status icon and an
@@ -104,10 +117,22 @@ const TOOL_STATUS_PILL_SELECTOR = '[data-testid="tool-status-pill"]';
 // pill, since a hidden pill already hides any children nested inside it.
 const TOOL_STATUS_MINOR_SELECTORS = '[data-testid="tool-status-spark"], [data-testid="tool-status-caret"]';
 const TOOL_PLACEHOLDER = "[tool]";
+// NOT confirmed whether this ever appears inside the MessageActions
+// toolbar (the operator's report on 2026-08-31 placed it in the message
+// body, but that wasn't independently re-verified with the same rigor as
+// the toolbar discovery below) — kept as its own selector rather than
+// dropped in favor of the container. Harmless if it later turns out to
+// always be inside the toolbar too: excluding the same element twice by
+// two different selectors is a no-op, not a bug.
 
 // Confirmed 2026-08-28: icon glyphs rendered with a private-use font
 // (Anthropicons). Their codepoints render as striped boxes anywhere outside
-// claude.ai's own font, so they're pure UI chrome — hidden silently.
+// claude.ai's own font, so they're pure UI chrome — hidden silently. NOT
+// confirmed whether icon glyphs also render outside the MessageActions
+// toolbar (e.g. inline in message content) — kept as its own selector for
+// the same reason as tool-status above: redundant-but-harmless if every
+// instance turns out to already be inside the toolbar, necessary if any
+// aren't.
 const ICON_GLYPH_SELECTOR = 'span[data-cds="Icon"]';
 
 // The code-block copy button (a hover-revealed wrapper inside <pre>). Its
@@ -440,8 +465,7 @@ function renderBlocksDom(node, out, skipSet, placeholderMap) {
 // simply not recurse into one, where innerText had no such option.
 function collectExclusions(row) {
   const skipSet = new Set();
-  row.querySelectorAll(EXCLUDED_CONTROL_SELECTORS).forEach((el) => skipSet.add(el));
-  row.querySelectorAll(TIMESTAMP_SELECTOR).forEach((el) => skipSet.add(el));
+  row.querySelectorAll(MESSAGE_ACTIONS_SELECTOR).forEach((el) => skipSet.add(el));
   row.querySelectorAll(ACCESSIBILITY_PREVIEW_SELECTOR).forEach((el) => skipSet.add(el));
   row.querySelectorAll(ICON_GLYPH_SELECTOR).forEach((el) => skipSet.add(el));
   row.querySelectorAll(TOOL_STATUS_MINOR_SELECTORS).forEach((el) => skipSet.add(el));

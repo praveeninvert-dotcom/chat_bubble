@@ -226,39 +226,87 @@ AFTER scrollTop=0 count: 7  range: 0-141
 RESTORED                    range: 131-141
 ```
 
-### Action bar / per-message controls — CONFIRMED 2026-08-28
+### MessageActions toolbar container — CONFIRMED 2026-08-31
 
-These render as text inside the row and leaked into `innerText` as garbage
-before being excluded. Reported directly by the operator during Part B
-testing, not yet independently re-verified by a discovery command run — treat
-as confirmed the same as anything else in this file.
+**The structural fix for a class of bug hit five separate times.** The
+sr-only heading, the action buttons, the timestamp, tool-status pills, and
+the "N / N" retry counter were each found individually — the operator
+spotting one fresh leak in the bubble at a time, over several days — and
+each was patched with its own selector before this one was found. Three of
+those five (action buttons, timestamp, retry counter) turned out to all live
+inside a single container:
+
+```html
+<div data-cds="MessageActions" data-reveal="fade" role="toolbar"
+     aria-label="Message actions" data-size="xs" tabindex="-1"
+     class="flex items-center select-none ...">
+  <!-- copy / retry / thumbs / read-aloud buttons, the timestamp, the
+       retry-variant counter -->
+</div>
+```
+
+Found via a discovery script (operator, 2026-08-31) that located the common
+ancestor of the retry button and the retry counter and confirmed it holds
+**only** the toolbar: the container's own text content was 19 characters
+(all whitespace plus the timestamp) against 204 for the whole row.
 
 | Fact | Value |
 |---|---|
-| Copy (assistant) | `[data-testid="action-bar-copy"]` |
-| Retry (assistant) | `[data-testid="action-bar-retry"]` |
-| Thumbs up | `[data-testid="action-bar-thumbs-up"]` |
-| Thumbs down | `[data-testid="action-bar-thumbs-down"]` |
-| Read aloud | `[data-testid="action-bar-read-aloud"]` |
-| Retry (user message) | `[data-testid="user-message-retry"]` |
-| Edit (user message) | `[data-testid="user-message-edit"]` |
-| Copy (user message) | `[data-testid="user-message-copy"]` |
+| MessageActions toolbar container | `[data-cds="MessageActions"]`, or `[role="toolbar"][aria-label="Message actions"]` as an independent fallback |
 
-extension/content.js excludes these by hiding the live elements
-(`display:none`), reading `row.innerText`, then restoring them — not by
-cloning the row, since `innerText` on a detached clone silently falls back to
-`textContent` and loses code-block formatting.
+Three stable, non-styling attributes confirmed on it: `data-cds`, `role`,
+and `aria-label`. No Tailwind classes involved. extension/content.js's
+`MESSAGE_ACTIONS_SELECTOR` combines both forms (comma-separated) so either
+surviving a redesign alone still works — they're unrelated attributes (a11y
+role/label vs. an internal component tag), not two names for the same fact,
+so one styling pass dropping both at once is unlikely.
 
-`action-bar-retry` and `user-message-retry` are also now actively clicked
-(not just hidden) by `handleRetry()`'s row lookup, added for the bubble's
-retry action — see SPEC.md §4's `retry` message. Whether these two elements
-are always present in the DOM (just hidden via opacity until hover, like the
-code-block copy button below) or only rendered once the row is hovered/
-focused is unconfirmed — `handleRetry` calls `.click()` on whatever
-`row.querySelector(selector)` finds, which works either way as long as the
-element exists at all; if it's ever genuinely absent until a real pointer
-hover, retry would report `RETRY_FAILED` for a row that DOM inspection would
-show the button on.
+This one container selector **replaces** three former per-element rules,
+which are deleted from content.js and no longer documented as separate
+fragile entries:
+
+| Subsumed rule | Former value |
+|---|---|
+| Action buttons (copy/retry/thumbs-up/thumbs-down/read-aloud, user-message-retry/edit/copy) | `EXCLUDED_CONTROL_SELECTORS`, eight `[data-testid="..."]` selectors |
+| Relative timestamp | `TIMESTAMP_SELECTOR`, `time[data-cds="RelativeTime"]` (markup itself unchanged — see below) |
+| Retry-variant ("N / N") counter | `RETRY_COUNTER_*`, a three-part class fingerprint — **was the fragile, CLASS-MATCH-ONLY rule**; now covered by the container instead |
+
+Because exclusion works by adding the matched element to a skip set the DOM
+walk checks by identity before recursing (see `collectExclusions` in
+content.js), skipping the container skips everything inside it in one step
+— including whatever renders in this toolbar *next*, without needing to be
+spotted and patched individually the way the previous five were.
+
+Two exclusions were checked and are explicitly **not** subsumed, since they
+were confirmed to sit outside this container (kept as their own selectors):
+
+- `h2.sr-only` (the accessibility-preview heading) — sits over the whole
+  row, not inside the toolbar.
+- The interrupted-response "Try again" button, below — an interrupted reply
+  doesn't render this toolbar at all, so it was never a candidate.
+
+Two more were **not verified either way** and are kept as their own
+selectors defensively rather than assumed subsumed:
+
+- The tool-status pill/spark/caret — the operator's original report placed
+  this in the message body, not the toolbar, but that was never
+  independently re-checked with the same rigor as this discovery.
+- Icon glyphs (`span[data-cds="Icon"]`) — likely appear both inside the
+  toolbar's own buttons and possibly elsewhere in message content; keeping
+  the selector is a no-op where it's redundant with the container and
+  necessary anywhere it isn't.
+
+`action-bar-retry` and `user-message-retry` `data-testid`s are still used
+directly (not via the deleted `EXCLUDED_CONTROL_SELECTORS` constant) by
+`handleRetry()`'s row lookup to actually click retry — see SPEC.md §4's
+`retry` message. That lookup is unaffected by this change. Whether these two
+elements are always present in the DOM (just hidden via opacity until
+hover, like the code-block copy button below) or only rendered once the row
+is hovered/focused is unconfirmed — `handleRetry` calls `.click()` on
+whatever `row.querySelector(selector)` finds, which works either way as
+long as the element exists at all; if it's ever genuinely absent until a
+real pointer hover, retry would report `RETRY_FAILED` for a row that DOM
+inspection would show the button on.
 
 ### Interrupted-response "Try again" button — CONFIRMED 2026-08-29, TEXT MATCH ONLY
 
@@ -294,7 +342,21 @@ happen) both report an error and click nothing — retry never falls back to
 clicking "Edit prompt", since that would put the page into an edit state the
 operator didn't ask for.
 
-### Trailing timestamp element — CONFIRMED 2026-08-28
+### Retry-variant counter ("N / N") — RESOLVED 2026-08-31
+
+Was its own CLASS-MATCH-ONLY rule (same fragility tier as "Try again"
+above) for one day. Now covered by the MessageActions toolbar container
+above — the counter lives inside it, so no separate selector is needed any
+more. See that section for what replaced it.
+
+### Trailing timestamp element — CONFIRMED 2026-08-28, now covered by the MessageActions container
+
+Excluded as part of the MessageActions toolbar (above) rather than by its
+own selector — `TIMESTAMP_SELECTOR` is deleted from content.js. The
+element's own markup is recorded here for reference, since knowing what it
+looks like still matters (e.g. for `TRAILING_TIMESTAMP_RE`, the text-pattern
+fallback in `cleanText()` for the case this element or its container isn't
+found):
 
 ```html
 <time data-cds="RelativeTime" datetime="2026-08-22T16:40:53.683Z"
@@ -304,13 +366,11 @@ operator didn't ask for.
 
 | Fact | Value |
 |---|---|
-| Timestamp element | `time[data-cds="RelativeTime"]` |
+| Timestamp element (for reference — not queried directly any more) | `time[data-cds="RelativeTime"]` |
 
-extension/content.js excludes it the same way as the action-bar controls
-(hide the live element, read `innerText`, restore). The old text-pattern
-regex (matching `"just now"` / `"N <unit> ago"` at the end of the string)
-stays in `cleanText()` as a fallback only, in case this element is ever
-renamed or missing.
+The old text-pattern regex (matching `"just now"` / `"N <unit> ago"` at the
+end of the string) stays in `cleanText()` as a fallback only, in case the
+element or its MessageActions container is ever renamed or missing.
 
 ### Tool/MCP status UI — CONFIRMED 2026-08-28
 

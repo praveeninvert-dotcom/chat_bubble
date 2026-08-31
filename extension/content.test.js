@@ -249,17 +249,71 @@ const { el, text } = require("./test-fakedom.js");
   console.log("OK: <pre> -> fenced code block via the existing, unchanged rebuildCodeFences");
 }
 
-// Exclusions must still work: h2.sr-only, an action-bar button, and the
-// relative-timestamp element all contribute nothing to the output.
+// h2.sr-only is excluded on its own — it sits outside the MessageActions
+// toolbar (a heading over the whole row), so it keeps its own selector.
 {
   const row = el("div", [
     el("h2", { class: "sr-only" }, ["You said: preview text"]),
     el("p", [text("Real message content")]),
-    el("button", { "data-testid": "action-bar-copy" }, ["Copy"]),
-    el("time", { "data-cds": "RelativeTime" }, ["6 days ago"]),
   ]);
   assert.strictEqual(domToMarkdown(row), "Real message content");
-  console.log("OK: h2.sr-only, action-bar buttons, and the relative-timestamp element are excluded");
+  console.log("OK: h2.sr-only is excluded");
+}
+
+// The whole MessageActions toolbar is excluded as one subtree, whatever's
+// inside it — a copy button, the timestamp, and the "N / N" retry counter,
+// none of which need their own selector any more. Identified by
+// data-cds="MessageActions".
+{
+  const row = el("div", [
+    el("p", [text("Real message content")]),
+    el(
+      "div",
+      { "data-cds": "MessageActions", role: "toolbar", "aria-label": "Message actions" },
+      [
+        el("button", { "data-testid": "action-bar-copy" }, ["Copy"]),
+        el("time", { "data-cds": "RelativeTime" }, ["6 days ago"]),
+        el("div", { class: "inline-flex items-center gap-1" }, [
+          el("span", { class: "self-center shrink-0 select-none font-small text-muted" }, ["3 / 3"]),
+        ]),
+      ]
+    ),
+  ]);
+  assert.strictEqual(domToMarkdown(row), "Real message content");
+  console.log("OK: whole MessageActions subtree excluded (button + timestamp + retry counter)");
+}
+
+// The secondary selector — role="toolbar" + aria-label="Message actions"
+// with no data-cds attribute — also excludes the subtree, proving the two
+// combined selectors are genuinely independent, not one disguised as two.
+{
+  const row = el("div", [
+    el("p", [text("Real message content")]),
+    el("div", { role: "toolbar", "aria-label": "Message actions" }, [el("button", ["Copy"])]),
+  ]);
+  assert.strictEqual(domToMarkdown(row), "Real message content");
+  console.log("OK: role=toolbar + aria-label fallback (no data-cds) also excludes the subtree");
+}
+
+// An unrelated toolbar (role="toolbar" but a different aria-label) is NOT
+// excluded — proving the match isn't so broad it eats any toolbar-like
+// region in the row.
+{
+  const row = el("div", [
+    el("p", [text("Real message content")]),
+    el("div", { role: "toolbar", "aria-label": "Formatting options" }, [text("Bold, Italic")]),
+  ]);
+  assert.strictEqual(domToMarkdown(row), "Real message content\n\nBold, Italic");
+  console.log("OK: an unrelated role=toolbar region (different aria-label) is left alone");
+}
+
+// A legitimate "3 / 3" Claude actually writes in a reply, outside any
+// MessageActions container, is preserved — the fix is scoped to the
+// toolbar, not to the text shape.
+{
+  const row = el("div", [el("p", [text("The score was 3 / 3")])]);
+  assert.strictEqual(domToMarkdown(row), "The score was 3 / 3");
+  console.log("OK: '3 / 3' outside the toolbar is left alone");
 }
 
 // Icon glyphs (Anthropicons, private-use-font spans) are excluded even
