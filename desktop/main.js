@@ -1,4 +1,4 @@
-const { app, BrowserWindow, globalShortcut, ipcMain, Tray, Menu, nativeImage, screen } = require("electron");
+const { app, BrowserWindow, globalShortcut, ipcMain, Tray, Menu, nativeImage, screen, shell } = require("electron");
 const path = require("node:path");
 const { createBubbleServer } = require("./server");
 const { getOrCreateToken, regenerateToken } = require("./token");
@@ -48,6 +48,24 @@ let tray = null;
 const MIN_WIDTH = 320;
 const MIN_HEIGHT = 400;
 const MAX_WIDTH = 700;
+
+// Deliberately duplicated from renderer/markdown.js's identical check,
+// rather than shared — the renderer has no `require`
+// (contextIsolation/nodeIntegration are both locked down, see
+// createWindow's webPreferences below), and the whole point of checking
+// again here is that this process does not trust the renderer's check.
+// Sharing one implementation between "the renderer's opinion" and "the
+// process that's actually about to open a URL" would mean a bug in that
+// one function breaks both layers identically — see the
+// bubble:open-external-link handler below, which is what actually calls
+// shell.openExternal. Passing an unvalidated URL straight to
+// shell.openExternal is a known Electron vulnerability (it can launch
+// arbitrary local applications/protocol handlers, not just a browser).
+const ALLOWED_LINK_SCHEMES = /^(https?|mailto):/i;
+
+function sanitizeLinkUrl(raw) {
+  return String(raw || "").replace(/^[\x00-\x20]+|[\x00-\x20]+$/g, "").replace(/[\t\r\n]/g, "");
+}
 
 // .panel's box-shadow in the renderer spans the whole window; recomputing
 // that blur on every recomposited frame of a live drag is expensive on a
@@ -147,6 +165,20 @@ function createWindow() {
 
   win.on("resize", onWindowDragActivity);
   win.on("move", onWindowDragActivity);
+
+  // Belt-and-braces: message links are already intercepted in the renderer
+  // (see app.js's click handler) and routed to shell.openExternal below
+  // instead of navigating. These two make that the only route a link (or
+  // any other in-page script) has, full stop — nothing can replace the
+  // bubble's own page with a navigated-to one, and nothing can pop a
+  // second BrowserWindow/webview. Doesn't fire for this file's own
+  // loadFile call below (Electron doesn't emit will-navigate for
+  // programmatic loadURL/loadFile), only for anything the page itself
+  // tries afterward.
+  win.webContents.on("will-navigate", (event) => {
+    event.preventDefault();
+  });
+  win.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
 
   win.loadFile(path.join(__dirname, "renderer", "index.html"));
 
@@ -254,6 +286,20 @@ ipcMain.on("bubble:history-request", (_event, { conversationId, beforeIndex }) =
 
 ipcMain.on("bubble:retry", (_event, { conversationId, index }) => {
   if (server) server.sendRetry(conversationId, index);
+});
+
+// The renderer already only ever builds an href for http:/https:/mailto:
+// (see renderer/markdown.js) — this check is independent of that one, not
+// a repeat of it: the renderer's opinion is not trusted just because it
+// arrived over IPC. See the ALLOWED_LINK_SCHEMES comment above for why this
+// isn't shared code with the renderer's check.
+ipcMain.on("bubble:open-external-link", (_event, { url }) => {
+  const cleaned = sanitizeLinkUrl(url);
+  if (!ALLOWED_LINK_SCHEMES.test(cleaned)) {
+    console.error("[bubble-server] refused to open external link with a disallowed scheme:", url);
+    return;
+  }
+  shell.openExternal(cleaned);
 });
 
 // Lets the renderer clamp the top-corner grips' width/height itself (see

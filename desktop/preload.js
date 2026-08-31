@@ -19,6 +19,10 @@ contextBridge.exposeInMainWorld("bubble", {
   requestHistory: (conversationId, beforeIndex) =>
     ipcRenderer.send("bubble:history-request", { conversationId, beforeIndex }),
   retryTurn: (conversationId, index) => ipcRenderer.send("bubble:retry", { conversationId, index }),
+  // Fire-and-forget: main.js validates the scheme again before ever calling
+  // shell.openExternal — see the handler in main.js. A URL crossing this
+  // boundary is never trusted just because the renderer already checked it.
+  openExternalLink: (url) => ipcRenderer.send("bubble:open-external-link", { url }),
   getToken: () => ipcRenderer.invoke("bubble:get-token"),
   regenerateToken: () => ipcRenderer.invoke("bubble:regenerate-token"),
   onServerEvent: (callback) => {

@@ -130,13 +130,6 @@ const CODE_COPY_BUTTON_SELECTOR = "pre button";
 const IMAGE_SELECTOR = "img";
 const IMAGE_PLACEHOLDER = "[image]";
 
-// Tags every placeholder <span> extractRowText inserts (for [tool], [image],
-// and any future placeholder) so attachRowObserver's MutationObserver can
-// tell "extractRowText inserted this" apart from "the page added a real
-// row" — without it, inserting/removing a marker would trigger our own
-// observer and schedule a pointless re-extraction on every read, forever.
-const PLACEHOLDER_MARKER_ATTR = "data-bubble-ext-marker";
-
 // Common language identifiers that appear as the bare "label line"
 // immediately before a code block (SELECTORS.md's raw sample: "...\n\npython
 // \ndef reverse_string..."). Curated rather than a generic
@@ -209,52 +202,298 @@ function rebuildCodeFences(row, text) {
   return insertCodeFences(text, codeTexts);
 }
 
-function extractRowText(row) {
-  const hiddenElements = [];
-  const insertedMarkers = [];
+// ---------------------------------------------------------------------
+// DOM -> markdown reconstruction
+// ---------------------------------------------------------------------
+//
+// claude.ai renders Claude's markdown into real HTML before this script
+// ever sees a row — a real <table>, a real <ul>, a real <a href>. Reading
+// innerText (as extractRowText used to, for the whole row) gives back the
+// visible TEXT with all of that gone: no pipes, no dashes, no
+// [text](url) — that syntax only ever existed in the raw output, before
+// the page rendered it. Rebuilding ``` fences from <pre> (below,
+// unchanged) solved this for exactly one element type; nothing else ever
+// got the same treatment, which is what made every other block type
+// arrive at the bubble as plain lines of text.
+//
+// So this walks the actual DOM tree and re-emits markdown syntax for the
+// structure it finds, instead of reading rendered text and hoping syntax
+// survived. <pre> is the deliberate exception (see PRE below in
+// renderBlocksDom) — its handling is confirmed working and untouched.
+//
+// Numeric nodeType constants (not the DOM's own Node.TEXT_NODE etc.)
+// because this file's extraction functions are required directly from
+// plain Node for testing (see content.test.js) — there is no global
+// `Node` there.
+const TEXT_NODE = 3;
+const ELEMENT_NODE = 1;
 
-  function hide(el) {
-    hiddenElements.push({ el, previousDisplay: el.style.display });
-    el.style.display = "none";
+// Inline-context rendering: markdown for a node and everything inside it,
+// with no block-level line breaks. Used for heading text, list item text,
+// table cell text, and link text — none of which can themselves contain a
+// paragraph break.
+function renderInlineDom(node, skipSet, placeholderMap) {
+  if (skipSet.has(node)) return "";
+  if (placeholderMap.has(node)) return placeholderMap.get(node);
+  if (node.nodeType === TEXT_NODE) return node.textContent;
+  if (node.nodeType !== ELEMENT_NODE) return "";
+
+  const children = () =>
+    Array.from(node.childNodes)
+      .map((c) => renderInlineDom(c, skipSet, placeholderMap))
+      .join("");
+
+  switch (node.tagName) {
+    case "STRONG":
+    case "B":
+      return "**" + children() + "**";
+    case "EM":
+    case "I":
+      return "*" + children() + "*";
+    case "DEL":
+    case "S":
+      return "~~" + children() + "~~";
+    case "CODE":
+      // Deliberately textContent, not children() — an inline code span's
+      // content is literal; nothing inside it should be re-interpreted as
+      // markdown syntax.
+      return "`" + node.textContent + "`";
+    case "BR":
+      return "\n";
+    case "A":
+      return "[" + children() + "](" + (node.getAttribute("href") || "") + ")";
+    default:
+      return children();
   }
+}
 
-  function placeholder(el, text) {
-    const marker = document.createElement("span");
-    marker.setAttribute(PLACEHOLDER_MARKER_ATTR, "true");
-    marker.textContent = text;
-    el.parentNode.insertBefore(marker, el);
-    insertedMarkers.push(marker);
-    hide(el);
-  }
+// Renders one <ul>/<ol>, recursing for a nested list found inside an <li>
+// so its markdown ends up indented deeper than the parent item — that's
+// the only signal markdown.js's own list parser (desktop/renderer/
+// markdown.js's parseList) uses to recognise nesting. 2 spaces per level
+// is arbitrary; it only has to be MORE than the parent's indent, not some
+// specific width. A <pre> found directly inside an <li> (a code block
+// inside a bullet) is also carried through as its own continuation line,
+// same reasoning as the top-level PRE case in renderBlocksDom below.
+function renderListDom(listEl, depth, skipSet, placeholderMap) {
+  const ordered = listEl.tagName === "OL";
+  const indent = "  ".repeat(depth);
+  const startAttr = ordered ? parseInt(listEl.getAttribute("start"), 10) : NaN;
+  let n = Number.isFinite(startAttr) ? startAttr : 1;
 
-  // Pure UI chrome — hidden silently, no placeholder.
-  row.querySelectorAll(EXCLUDED_CONTROL_SELECTORS).forEach(hide);
-  row.querySelectorAll(TIMESTAMP_SELECTOR).forEach(hide);
-  row.querySelectorAll(ACCESSIBILITY_PREVIEW_SELECTOR).forEach(hide);
-  row.querySelectorAll(ICON_GLYPH_SELECTOR).forEach(hide);
-  row.querySelectorAll(CODE_COPY_BUTTON_SELECTOR).forEach(hide);
-  row.querySelectorAll(TOOL_STATUS_MINOR_SELECTORS).forEach(hide);
+  const lines = [];
+  Array.from(listEl.childNodes).forEach((li) => {
+    if (skipSet.has(li)) return;
+    if (li.nodeType !== ELEMENT_NODE || li.tagName !== "LI") return;
 
-  // Content the relay can't carry — a placeholder marker takes its place
-  // (SPEC.md §7: a visible gap beats a silent one).
-  row.querySelectorAll(TOOL_STATUS_PILL_SELECTOR).forEach((pill) => placeholder(pill, TOOL_PLACEHOLDER));
-  row.querySelectorAll(IMAGE_SELECTOR).forEach((img) => placeholder(img, IMAGE_PLACEHOLDER));
+    const marker = ordered ? `${n}. ` : "- ";
+    n++;
 
-  let raw;
+    let itemInline = "";
+    const continuations = [];
+    Array.from(li.childNodes).forEach((liChild) => {
+      if (skipSet.has(liChild)) return;
+      if (placeholderMap.has(liChild)) {
+        itemInline += placeholderMap.get(liChild);
+        return;
+      }
+      if (liChild.nodeType === ELEMENT_NODE && (liChild.tagName === "UL" || liChild.tagName === "OL")) {
+        continuations.push(renderListDom(liChild, depth + 1, skipSet, placeholderMap));
+        return;
+      }
+      if (liChild.nodeType === ELEMENT_NODE && liChild.tagName === "PRE") {
+        continuations.push(liChild.innerText || "");
+        return;
+      }
+      itemInline += renderInlineDom(liChild, skipSet, placeholderMap);
+    });
+
+    lines.push(indent + marker + itemInline.trim());
+    if (continuations.length) lines.push(continuations.join("\n"));
+  });
+  return lines.join("\n");
+}
+
+// Renders a <table> as a pipe table with a header separator row — the
+// shape markdown.js's own table parser (splitTableRow/isTableSeparator)
+// expects. Cell text can't contain a real newline (it would split the
+// row) or a literal "|" (that parser's cell splitter has no escaping for
+// one) — both are neutralised rather than preserved exactly, which only
+// matters for content nobody would type inside a table cell to begin
+// with.
+function renderTableDom(tableEl, skipSet, placeholderMap) {
+  const trs = Array.from(tableEl.querySelectorAll("tr"));
+  if (trs.length === 0) return "";
+
+  const cellsOf = (tr) =>
+    Array.from(tr.children)
+      .filter((c) => (c.tagName === "TH" || c.tagName === "TD") && !skipSet.has(c))
+      .map((c) => renderInlineDom(c, skipSet, placeholderMap).replace(/\n/g, " ").replace(/\|/g, "/").trim());
+
+  const header = cellsOf(trs[0]);
+  const separator = header.map(() => "---");
+  const bodyRows = trs.slice(1).map(cellsOf);
+  const toRow = (cells) => "| " + cells.join(" | ") + " |";
+  return [toRow(header), toRow(separator), ...bodyRows.map(toRow)].join("\n");
+}
+
+// Block-context rendering: walks `node`'s children, pushing one markdown
+// block per recognised block-level element into `out`, and accumulating
+// any bare inline content (text/formatting sitting directly in the row,
+// not wrapped in a block element) into its own paragraph. Recurses for
+// anything that's itself a block-level container (blockquote, or a
+// generic wrapper like <p>/<div>) so nested structure comes out right.
+function renderBlocksDom(node, out, skipSet, placeholderMap) {
+  let paragraph = [];
+  const flush = () => {
+    const text = paragraph.join("").trim();
+    if (text) out.push(text);
+    paragraph = [];
+  };
+
+  Array.from(node.childNodes).forEach((child) => {
+    if (skipSet.has(child)) return;
+    if (placeholderMap.has(child)) {
+      paragraph.push(placeholderMap.get(child));
+      return;
+    }
+    if (child.nodeType === TEXT_NODE) {
+      // A whitespace-only text node that contains a newline is HTML source
+      // formatting (indentation between sibling tags), not content —
+      // including it would flush a spurious empty paragraph between real
+      // blocks. A bare space with no newline is kept even if it's "only
+      // whitespace" by the same trim() check — that's the literal word
+      // separator between two inline siblings, e.g. "<strong>bold</strong>
+      // <em>italic</em>", and dropping it would glue them together.
+      const isFormattingWhitespace = child.textContent.trim() === "" && /\n/.test(child.textContent);
+      if (!isFormattingWhitespace) paragraph.push(child.textContent);
+      return;
+    }
+    if (child.nodeType !== ELEMENT_NODE) return;
+
+    switch (child.tagName) {
+      case "H1":
+      case "H2":
+      case "H3":
+      case "H4":
+      case "H5":
+      case "H6":
+        flush();
+        out.push("#".repeat(Number(child.tagName[1])) + " " + renderInlineDom(child, skipSet, placeholderMap));
+        break;
+      case "HR":
+        flush();
+        out.push("---");
+        break;
+      case "UL":
+      case "OL":
+        flush();
+        out.push(renderListDom(child, 0, skipSet, placeholderMap));
+        break;
+      case "TABLE":
+        flush();
+        out.push(renderTableDom(child, skipSet, placeholderMap));
+        break;
+      case "BLOCKQUOTE": {
+        flush();
+        const inner = [];
+        renderBlocksDom(child, inner, skipSet, placeholderMap);
+        out.push(
+          inner
+            .join("\n\n")
+            .split("\n")
+            .map((line) => (line ? "> " + line : ">"))
+            .join("\n")
+        );
+        break;
+      }
+      case "PRE":
+        // Left as raw text, unwalked — rebuildCodeFences (below, unchanged)
+        // finds this exact text via pre.innerText and wraps it in fences.
+        // This is the one part of the DOM->markdown walk that predates
+        // this rewrite and stays exactly as it was: confirmed working,
+        // preserves indentation.
+        flush();
+        out.push(child.innerText || "");
+        break;
+      case "P":
+      case "DIV": {
+        flush();
+        const inner = [];
+        renderBlocksDom(child, inner, skipSet, placeholderMap);
+        if (inner.length) out.push(inner.join("\n\n"));
+        break;
+      }
+      default:
+        paragraph.push(renderInlineDom(child, skipSet, placeholderMap));
+    }
+  });
+  flush();
+}
+
+// Same selectors extractRowText has always excluded (see their
+// definitions above) — collected once per row into a skip set and a
+// placeholder map so renderBlocksDom/renderInlineDom can check them by
+// object identity while walking, rather than hiding elements in the live
+// DOM the way the old innerText-based version had to. No DOM mutation
+// happens for any of these now: a walker that visits nodes itself can
+// simply not recurse into one, where innerText had no such option.
+function collectExclusions(row) {
+  const skipSet = new Set();
+  row.querySelectorAll(EXCLUDED_CONTROL_SELECTORS).forEach((el) => skipSet.add(el));
+  row.querySelectorAll(TIMESTAMP_SELECTOR).forEach((el) => skipSet.add(el));
+  row.querySelectorAll(ACCESSIBILITY_PREVIEW_SELECTOR).forEach((el) => skipSet.add(el));
+  row.querySelectorAll(ICON_GLYPH_SELECTOR).forEach((el) => skipSet.add(el));
+  row.querySelectorAll(TOOL_STATUS_MINOR_SELECTORS).forEach((el) => skipSet.add(el));
+
+  // Content the relay can't carry — the placeholder text takes its place
+  // directly in the walk's output (SPEC.md §7: a visible gap beats a
+  // silent one), rather than a marker span inserted into the DOM.
+  const placeholderMap = new Map();
+  row.querySelectorAll(TOOL_STATUS_PILL_SELECTOR).forEach((el) => placeholderMap.set(el, TOOL_PLACEHOLDER));
+  row.querySelectorAll(IMAGE_SELECTOR).forEach((el) => placeholderMap.set(el, IMAGE_PLACEHOLDER));
+
+  return { skipSet, placeholderMap };
+}
+
+// Walks `row` and returns markdown text, exported so tests can build a
+// DOM fragment and check its output directly — see content.test.js.
+//
+// The one remaining DOM mutation is hiding each code block's own copy
+// button before reading pre.innerText (inside rebuildCodeFences and this
+// function's own PRE case): it's a hover-reveal button shown via opacity,
+// not display:none, so it isn't naturally excluded from innerText the way
+// display:none content is — the same reason the pre-existing <pre>
+// handling already had to hide it first. Restored synchronously in the
+// finally block; never a detached clone, for the same reason as always —
+// innerText on a detached node silently falls back to textContent, which
+// is exactly the code-formatting-destroying behaviour ruled out for <pre>.
+function domToMarkdown(row) {
+  const { skipSet, placeholderMap } = collectExclusions(row);
+
+  const copyButtons = Array.from(row.querySelectorAll(CODE_COPY_BUTTON_SELECTOR));
+  const previousDisplay = copyButtons.map((btn) => btn.style.display);
+  copyButtons.forEach((btn) => {
+    btn.style.display = "none";
+  });
+
   try {
-    raw = row.innerText || "";
-    raw = rebuildCodeFences(row, raw);
+    const blocks = [];
+    renderBlocksDom(row, blocks, skipSet, placeholderMap);
+    return rebuildCodeFences(row, blocks.join("\n\n"));
   } finally {
-    insertedMarkers.forEach((m) => m.remove());
-    hiddenElements.forEach(({ el, previousDisplay }) => {
-      el.style.display = previousDisplay;
+    copyButtons.forEach((btn, i) => {
+      btn.style.display = previousDisplay[i];
     });
   }
-  return cleanText(raw);
+}
+
+function extractRowText(row) {
+  return cleanText(domToMarkdown(row));
 }
 
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { cleanText, stripAccessibilityDuplicate, stripTitleSuffix, insertCodeFences };
+  module.exports = { cleanText, stripAccessibilityDuplicate, stripTitleSuffix, insertCodeFences, domToMarkdown };
 }
 
 // ---------------------------------------------------------------------
@@ -287,6 +526,19 @@ if (typeof module !== "undefined" && module.exports) {
     // SPA has settled — the same race this whole mechanism exists to avoid,
     // just reached through a second path.
     initialConversationConfirmed: false,
+    // Confirmed 2026-08-29: document.title lags behind a same-tab switch
+    // between existing conversations — reading it in the same instant the
+    // URL/id changes captured the PREVIOUS conversation's title, sent
+    // alongside the NEW id, which showed up in the bubble as the header
+    // always being one switch behind. See handlePossibleConversationChange.
+    // titleConfirmed is false from the moment an id change is detected
+    // until document.title is trusted again; pendingStaleTitle is the value
+    // read at that exact moment (the one being distrusted), used to detect
+    // when a later read has actually moved on from it; titleChangeTs bounds
+    // how long that wait lasts.
+    titleConfirmed: true,
+    pendingStaleTitle: null,
+    titleChangeTs: 0,
     container: null,
     rowObserver: null,
     rowDebounceTimer: null,
@@ -389,6 +641,10 @@ if (typeof module !== "undefined" && module.exports) {
     }
     if (msg.type === "prompt") {
       handlePrompt(msg);
+      return;
+    }
+    if (msg.type === "history.request") {
+      handleHistoryRequest(msg);
       return;
     }
     log("Received", msg.type, "(handled starting in a later part)");
@@ -649,16 +905,36 @@ if (typeof module !== "undefined" && module.exports) {
     );
     liveTurn.lastText = fullText;
     if (isAppend) {
-      if (delta) send({ type: "turn.delta", turnId: liveTurn.turnId, conversationId: state.conversationId, text: delta });
+      if (delta) {
+        send({
+          type: "turn.delta",
+          turnId: liveTurn.turnId,
+          conversationId: state.conversationId,
+          index: liveTurn.index,
+          text: delta,
+        });
+      }
     } else {
-      send({ type: "turn.replace", turnId: liveTurn.turnId, conversationId: state.conversationId, text: fullText });
+      send({
+        type: "turn.replace",
+        turnId: liveTurn.turnId,
+        conversationId: state.conversationId,
+        index: liveTurn.index,
+        text: fullText,
+      });
     }
   }
 
   function finishLiveTurn(idx, liveTurn) {
     stopLiveTurn(liveTurn);
     const finalText = extractRowText(liveTurn.row);
-    send({ type: "turn.end", turnId: liveTurn.turnId, conversationId: state.conversationId, text: finalText });
+    send({
+      type: "turn.end",
+      turnId: liveTurn.turnId,
+      conversationId: state.conversationId,
+      index: idx,
+      text: finalText,
+    });
     state.liveTurns.delete(idx);
   }
 
@@ -669,21 +945,14 @@ if (typeof module !== "undefined" && module.exports) {
   // pause). Also watches characterData, since streaming updates may change
   // existing text nodes in place rather than replacing whole nodes.
   function watchStreaming(row, idx, liveTurn) {
-    const observer = new MutationObserver((mutations) => {
-      // Ignore mutations caused by our OWN extractRowText() calls (the
-      // [tool]/[image] marker insert-then-remove) — otherwise reading this
-      // row's text would trigger this same observer, which would read the
-      // text again, forever. Attribute/characterData records never come
-      // from us (extractRowText only ever inserts/removes whole marker
-      // nodes and toggles style.display, which attributeFilter excludes),
-      // so only childList records need filtering.
-      const hasRealChange = mutations.some((m) => {
-        if (m.type !== "childList") return true;
-        const nodes = [...m.addedNodes, ...m.removedNodes];
-        return nodes.some((n) => !(n.hasAttribute && n.hasAttribute(PLACEHOLDER_MARKER_ATTR)));
-      });
-      if (!hasRealChange) return;
-
+    const observer = new MutationObserver(() => {
+      // No filtering needed here: extractRowText/domToMarkdown no longer
+      // mutates the DOM in any way this observer would see — it walks the
+      // tree read-only rather than inserting/removing marker nodes, and
+      // its one remaining mutation (hiding a code block's copy button via
+      // style.display) is excluded by attributeFilter below regardless.
+      // Every mutation MutationObserver hands this callback is therefore
+      // a real one.
       emitDeltaIfChanged(liveTurn);
       if (row.getAttribute("data-perf-row-streaming") === "false") {
         finishLiveTurn(idx, liveTurn);
@@ -730,7 +999,12 @@ if (typeof module !== "undefined" && module.exports) {
       ts: Date.now(),
       index: idx,
     });
-    const liveTurn = { turnId, role, lastText: "", row, textObserver: null };
+    // index is kept on liveTurn itself (not just as the state.liveTurns map
+    // key) so emitDeltaIfChanged — which only receives liveTurn, not idx —
+    // can send it on turn.delta/turn.replace too (SPEC.md §4, 2026-08-30):
+    // the server needs it to persist a turn even if it never saw this
+    // turn.start (e.g. a desktop app restart mid-reply lost pendingTurns).
+    const liveTurn = { turnId, role, index: idx, lastText: "", row, textObserver: null };
     state.liveTurns.set(idx, liveTurn);
 
     if (role === "assistant") {
@@ -789,18 +1063,40 @@ if (typeof module !== "undefined" && module.exports) {
     sendStatus();
   }
 
+  // Confirmed 2026-08-29: document.title doesn't update in the same instant
+  // as location.pathname when switching between EXISTING conversations via
+  // the sidebar (no page reload) — how long the real title takes to catch
+  // up isn't guaranteed. A give-up ceiling for the wait below, the same
+  // idea as waitForRenderedConversation's INITIAL_ID_CONFIRM_TIMEOUT_MS: if
+  // document.title genuinely never diverges from the stale value (an
+  // untested case), the header shouldn't be stuck on "Untitled
+  // conversation" forever.
+  const TITLE_CONFIRM_TIMEOUT_MS = 5000;
+
   function handlePossibleConversationChange() {
     if (!state.initialConversationConfirmed) return;
     const id = getConversationIdFromUrl();
-    const title = computeTitle();
+    const rawTitle = computeTitle();
     const idChanged = id !== state.conversationId;
-    const titleChanged = title !== state.title;
-    if (!idChanged && !titleChanged) return;
-    log(`Conversation ${idChanged ? "changed" : "title updated"}: id=${id || "null"} title=${JSON.stringify(title)}`);
-    const previousConversationId = state.conversationId;
-    state.conversationId = id;
-    state.title = title;
+
     if (idChanged) {
+      log(
+        `Conversation changed: id=${id || "null"} (title not trusted yet — document.title currently reads ` +
+          `${JSON.stringify(rawTitle)}, which is likely still the previous page's — see the fix note above ` +
+          `TITLE_CONFIRM_TIMEOUT_MS)`
+      );
+      const previousConversationId = state.conversationId;
+      state.conversationId = id;
+      // null, not rawTitle — sending rawTitle here is exactly the bug this
+      // fixes (SPEC.md's conversation message): it was reliably the
+      // PREVIOUS conversation's title, since document.title hadn't caught
+      // up yet at this exact instant. pendingStaleTitle/titleChangeTs are
+      // what the branch below uses to recognise the moment it actually
+      // does.
+      state.title = null;
+      state.titleConfirmed = false;
+      state.pendingStaleTitle = rawTitle;
+      state.titleChangeTs = Date.now();
       // Clears the baseline too — normally announceConversation below (via
       // sendTurnWindow) re-establishes it once the new conversation
       // actually has rows rendered (see sendTurnWindow).
@@ -816,8 +1112,36 @@ if (typeof module !== "undefined" && module.exports) {
         state.baselineMaxIndex = -1;
         state.baselineEstablished = true;
       }
+      // Sent immediately, title:null and all — turn capture (attachRowObserver,
+      // sendTurnWindow, resetLiveTurnTracking above) must not wait on a
+      // cosmetic header value that might take an unknown amount of time, or
+      // in an untested case might never change at all.
+      announceConversation();
+      return;
     }
-    announceConversation();
+
+    if (!state.titleConfirmed) {
+      const stillLooksStale = rawTitle === state.pendingStaleTitle;
+      const timedOut = Date.now() - state.titleChangeTs > TITLE_CONFIRM_TIMEOUT_MS;
+      if (stillLooksStale && !timedOut) return; // keep waiting
+      state.title = rawTitle;
+      state.titleConfirmed = true;
+      log(
+        `Title confirmed for conversation ${state.conversationId || "null"}: ${JSON.stringify(rawTitle)}` +
+          (stillLooksStale ? " (gave up waiting for document.title to change — using whatever is there now)" : "")
+      );
+      sendConversation();
+      return;
+    }
+
+    // Steady state: same conversation, already-confirmed title. Only a
+    // genuine later change (e.g. claude.ai auto-titling a conversation
+    // after its first reply) reaches here.
+    if (rawTitle !== state.title) {
+      state.title = rawTitle;
+      log(`Title updated: ${JSON.stringify(rawTitle)}`);
+      sendConversation();
+    }
   }
 
   // Structural observer only: rows being added or removed as the operator
@@ -845,13 +1169,10 @@ if (typeof module !== "undefined" && module.exports) {
       // because the server merges by index rather than replacing, and
       // sendTurnWindow's own dedup skips the send if nothing changed.
       //
-      // Also ignore our own placeholder markers (see
-      // extractRowText/PLACEHOLDER_MARKER_ATTR) — otherwise reading a row's
-      // text would trigger this observer, which would schedule another
-      // read, forever.
-      const hasAdditions = mutations.some((m) =>
-        Array.from(m.addedNodes).some((n) => !(n.hasAttribute && n.hasAttribute(PLACEHOLDER_MARKER_ATTR)))
-      );
+      // No exclusion needed here for our own reads: extractRowText/
+      // domToMarkdown walks each row read-only and never inserts or
+      // removes a node, so every addition this observer sees is real.
+      const hasAdditions = mutations.some((m) => m.addedNodes.length > 0);
       if (!hasAdditions) return;
       if (state.rowDebounceTimer) clearTimeout(state.rowDebounceTimer);
       state.rowDebounceTimer = setTimeout(() => {
@@ -1010,12 +1331,11 @@ if (typeof module !== "undefined" && module.exports) {
   }
 
   // -------------------------------------------------------------------
-  // Part D (partial): retry (SPEC.md §4). Only the single-row
-  // locate/scroll/restore mechanism retry needs is built here — the general
-  // multi-step history.request harvest (batches of older messages, §4.1) is
-  // a separate, larger piece that is NOT implemented yet. findScrollContainer
-  // and withRowInView are written so that future work can reuse them rather
-  // than re-solving the same scroll-container problem twice.
+  // Part D (retry, SPEC.md §4). The single-row locate/scroll/restore
+  // mechanism retry needs. findScrollContainer, estimateScrollTopForIndex,
+  // and SCROLL_SETTLE_MS are also reused by history harvesting (Part D2,
+  // further below) rather than re-solving the same scroll-container problem
+  // twice.
   // -------------------------------------------------------------------
 
   // NOT a confirmed selector-backed fact — a plain text match. Confirmed by
@@ -1036,6 +1356,12 @@ if (typeof module !== "undefined" && module.exports) {
   // this when exactly one button in the row matches it exactly — see there
   // for why, and why "Edit prompt" is never a fallback.
   const TRY_AGAIN_BUTTON_TEXT = "Try again";
+
+  // Confirmed 2026-08-27 (SELECTORS.md): scrollTop=0 renders index 0 after
+  // ~1200ms. Used as the settle delay after every programmatic scroll step —
+  // by withRowInView below and by history harvesting (Part D2, further
+  // down).
+  const SCROLL_SETTLE_MS = 1200;
 
   function findScrollContainer() {
     const list = document.querySelector('[data-testid="transcript-list"]');
@@ -1071,6 +1397,17 @@ if (typeof module !== "undefined" && module.exports) {
       .sort((a, b) => a - b);
   }
 
+  // Shared by withRowInView (retry, below — one exact index) and
+  // handleHistoryRequest (Part D2, further down — stepping toward a
+  // boundary index): the same proportional-estimate math, factored out
+  // once instead of duplicated. Falls back to the very top (0) when total
+  // isn't known yet, matching the one jump SELECTORS.md confirmed actually
+  // renders new rows.
+  function estimateScrollTopForIndex(scroller, index, total) {
+    if (!total || total <= 1) return 0;
+    return Math.round((index / (total - 1)) * (scroller.scrollHeight - scroller.clientHeight));
+  }
+
   // Scrolls the transcript so the row at `index` is rendered, if it isn't
   // already (the virtualizer only renders rows near the viewport — SPEC.md
   // §4.1), runs fn(row) (row is null if it still couldn't be found), then
@@ -1098,7 +1435,7 @@ if (typeof module !== "undefined" && module.exports) {
     }
 
     const originalScrollTop = scroller.scrollTop;
-    const wait = () => new Promise((resolve) => setTimeout(resolve, 1200));
+    const wait = () => new Promise((resolve) => setTimeout(resolve, SCROLL_SETTLE_MS));
 
     // retry knows the exact index it wants, unlike a full harvest — jump
     // toward an estimate of where it lives using the currently-known total
@@ -1107,12 +1444,7 @@ if (typeof module !== "undefined" && module.exports) {
     // misses.
     const collected = collectWindow();
     const total = collected && collected.total ? collected.total : null;
-    let target;
-    if (total && total > 1) {
-      target = Math.round((index / (total - 1)) * (scroller.scrollHeight - scroller.clientHeight));
-    } else {
-      target = 0;
-    }
+    const target = estimateScrollTopForIndex(scroller, index, total);
     log(
       `retry: index=${index} not rendered, scrolling. total=${total} scrollHeight=${scroller.scrollHeight} ` +
         `clientHeight=${scroller.clientHeight} originalScrollTop=${originalScrollTop} -> target=${target}`
@@ -1287,6 +1619,338 @@ if (typeof module !== "undefined" && module.exports) {
       }
       log(`retry: failed for index=${msg.index} — ${message}`);
       send({ type: "error", code: "RETRY_FAILED", message });
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // Part D2: history harvesting (SPEC.md §4's `history.request`)
+  // -------------------------------------------------------------------
+
+  // Hard ceiling regardless of the no-progress check below — a very long
+  // conversation, or an estimate that lands somewhere the virtualizer
+  // doesn't respond well to, should stop well before the operator wonders
+  // if it's hung, not loop indefinitely. In practice the initial estimate
+  // jump (see handleHistoryRequest) means real harvests finish in a
+  // handful of steps; this is a safety net, not the expected path.
+  const MAX_HARVEST_STEPS = 40;
+
+  // Handles a relayed `history.request` (SPEC.md §4.1): step the transcript's
+  // scroll container upward, sending a turn.window after every step, until
+  // either the requested boundary is covered or the top of the conversation
+  // is reached — then ALWAYS restore the original scroll position and report
+  // `history.done`, which is what the bubble waits for to know the harvest
+  // is over (as opposed to just one more incremental batch arriving — a
+  // long harvest sends many turn.window messages before it's actually
+  // finished).
+  //
+  // Reuses findScrollContainer, estimateScrollTopForIndex, and
+  // renderedIndices from the retry work above rather than re-solving the
+  // same scroll-container problem — the one thing genuinely new here is the
+  // stepping loop itself, since withRowInView's contract (find one exact
+  // row, run a callback, restore) doesn't fit "capture a batch after every
+  // step." Settling after each step uses waitForIndicesChange, not
+  // SCROLL_SETTLE_MS/wait() (retry's own fixed wait, unchanged) — see the
+  // comment above HARVEST_STEP_SETTLE_TIMEOUT_MS, below, for why.
+  //
+  // The very first move is a jump toward an ESTIMATE of where beforeIndex
+  // lives (the same math retry's withRowInView uses), not a plain step from
+  // wherever the live view currently sits. Without it, a harvest deep into a
+  // long conversation would have to step through — and resend via
+  // turn.window — every index between the live tail and beforeIndex that
+  // the bubble already has, one virtualizer window at a time. The estimate
+  // jump is what keeps "do not harvest more than asked" from also meaning
+  // "and take forever getting there."
+  // 2026-08-29, operator-reported bug: harvest indicator showed "20 of 281
+  // loaded" and just sat there for a while, only actually loading anything
+  // once the operator switched to the claude.ai tab and scrolled it by
+  // hand. Two live candidates were identified, not yet distinguished at the
+  // time:
+  //   1. The claude.ai tab is normally BACKGROUNDED while the bubble is
+  //      used (the whole point of this project) — Chrome throttles
+  //      background-tab timers, both setTimeout directly and, separately,
+  //      requestAnimationFrame (which a virtualizer may use internally to
+  //      batch a re-render after a scroll event). The old fixed
+  //      SCROLL_SETTLE_MS wait could be taking far longer than 1200ms in
+  //      practice, or never firing until the tab is foregrounded.
+  //   2. Setting scroller.scrollTop programmatically might not be producing
+  //      a real "scroll" event the way a physical wheel/trackpad scroll
+  //      does — or produces one the virtualizer doesn't act on the same way.
+  // 2026-08-30: candidate 1 is now addressed structurally — the fixed wait
+  // below is replaced by waitForIndicesChange, which resolves as soon as
+  // the DOM actually shows new rows instead of guessing a duration, so
+  // timer/rAF throttling can no longer cause a wait to end before the
+  // virtualizer has actually responded. This has NOT yet been confirmed
+  // against a genuinely backgrounded tab (the original diagnostic run
+  // showed visibilityState=visible throughout, so candidate 1 was always an
+  // inference, not a confirmed cause) — the logging below (elapsed time,
+  // visibilityState, changed/timed-out) is what the next backgrounded test
+  // run should check to confirm or kill it. Candidate 2's own diagnostics
+  // (onDiagnosticScroll/onDiagnosticVisibility, and the wheel/touchstart
+  // interference listeners below, which are unrelated — those detect
+  // genuine operator input, not this) are unchanged.
+  const realNow = () => Date.now();
+
+  // Generous ceiling for how long ONE step waits for the virtualizer to
+  // actually re-render after a scrollTop change — deliberately much larger
+  // than the ~1200ms an active, foregrounded tab needs (SELECTORS.md),
+  // because a backgrounded tab (this app's normal operating condition) may
+  // throttle the timers/rAF the virtualizer's re-render depends on. Distinct
+  // from SCROLL_SETTLE_MS, which retry's withRowInView still uses unchanged
+  // — this constant only affects history harvesting. Most steps resolve far
+  // sooner than this via waitForIndicesChange below; the ceiling only binds
+  // a step that's genuinely stuck (or badly throttled), so it can't hang
+  // the harvest forever.
+  const HARVEST_STEP_SETTLE_TIMEOUT_MS = 8000;
+
+  // Waits for renderedIndices() to actually change from previousKey — a
+  // real DOM signal instead of a fixed timeout, so a backgrounded tab's
+  // throttled timers/rAF can't cause the wait to end before the virtualizer
+  // has genuinely re-rendered. Resolves `true` (changed) as soon as a
+  // childList mutation on the transcript container produces a different
+  // rendered index set, or `false` (timed out) after timeoutMs with no
+  // change — whichever comes first. A step that times out is exactly what
+  // the existing no-progress check (in handleHistoryRequest, below) already
+  // expects to see on its next read, so no other stop-condition logic needs
+  // to change.
+  function waitForIndicesChange(previousKey, timeoutMs) {
+    return new Promise((resolve) => {
+      if (renderedIndices().join(",") !== previousKey) {
+        resolve(true);
+        return;
+      }
+      const container = document.querySelector('[data-testid="transcript-list"]');
+      let settled = false;
+      let observer = null;
+      function finish(changed) {
+        if (settled) return;
+        settled = true;
+        if (observer) observer.disconnect();
+        clearTimeout(timer);
+        resolve(changed);
+      }
+      if (container) {
+        observer = new MutationObserver(() => {
+          if (renderedIndices().join(",") !== previousKey) finish(true);
+        });
+        observer.observe(container, { childList: true, subtree: true });
+      }
+      const timer = setTimeout(() => finish(false), timeoutMs);
+    });
+  }
+
+  // Confirmed 2026-08-29: four history.request messages arrived within 1.5
+  // seconds (beforeIndex 16, 12, 10, 7), all manipulating the same scroll
+  // container concurrently — one harvest's finally block restored
+  // scrollTop out from under another mid-jump, which is what made the
+  // whole thing look stalled until a manual scroll intervened.
+  // originalScrollTop is only meaningful if exactly one harvest owns the
+  // scroll position at a time, so a second request arriving while one is
+  // already running is REFUSED, not queued: the bubble-side fix (below)
+  // means it shouldn't send a second request before the first's
+  // history.done arrives, so a real overlap here means something upstream
+  // is still wrong — and by the time a queued run reached an old
+  // beforeIndex, the bubble has likely already moved past it anyway.
+  let historyHarvestInFlight = false;
+  let currentHarvestBeforeIndex = null;
+
+  async function handleHistoryRequest(msg) {
+    log(`history: received request for beforeIndex=${msg && msg.beforeIndex} conversationId=${msg && msg.conversationId}`);
+
+    if (!msg || typeof msg.beforeIndex !== "number") {
+      send({ type: "error", code: "HISTORY_FAILED", message: "History request was missing beforeIndex." });
+      return;
+    }
+    if (msg.conversationId !== state.conversationId) {
+      log(`history: conversationId mismatch — request had ${msg.conversationId}, current is ${state.conversationId}.`);
+      send({ type: "error", code: "HISTORY_FAILED", message: "Conversation changed before history could be harvested." });
+      return;
+    }
+    if (historyHarvestInFlight) {
+      log(
+        `history: refused — a harvest for beforeIndex=${currentHarvestBeforeIndex} is already running ` +
+          `(new request wanted beforeIndex=${msg.beforeIndex}).`
+      );
+      send({ type: "error", code: "HISTORY_BUSY", message: "A history harvest is already in progress. Wait for it to finish." });
+      return;
+    }
+    historyHarvestInFlight = true;
+    currentHarvestBeforeIndex = msg.beforeIndex;
+
+    const requestConversationId = msg.conversationId;
+    const beforeIndex = msg.beforeIndex;
+
+    const scroller = findScrollContainer();
+    if (!scroller) {
+      log("history: no scroll container found — nothing to harvest.");
+      historyHarvestInFlight = false;
+      currentHarvestBeforeIndex = null;
+      send({ type: "history.done", conversationId: requestConversationId, beforeIndex, reason: "no-scroll-container" });
+      return;
+    }
+
+    const originalScrollTop = scroller.scrollTop;
+
+    // DIAGNOSTIC — candidate 2 (see above): does OUR OWN scrollTop
+    // assignment ever produce a real "scroll" event on this container, and
+    // when relative to when we set it? Diagnostic-only: never sets
+    // userInterfered, unlike the wheel/touchstart listeners below.
+    let scrollEventCount = 0;
+    const onDiagnosticScroll = () => {
+      scrollEventCount++;
+      log(
+        `history DIAGNOSTIC: native "scroll" event #${scrollEventCount} on the container, t=${realNow()}, ` +
+          `scrollTop=${scroller.scrollTop}, document.visibilityState=${document.visibilityState}`
+      );
+    };
+    scroller.addEventListener("scroll", onDiagnosticScroll, { passive: true });
+
+    // DIAGNOSTIC — candidate 1: did the tab change foreground/background
+    // state partway through, and when relative to the steps around it?
+    const onDiagnosticVisibility = () => {
+      log(`history DIAGNOSTIC: document.visibilitychange -> ${document.visibilityState}, t=${realNow()}`);
+    };
+    document.addEventListener("visibilitychange", onDiagnosticVisibility);
+
+    log(
+      `history DIAGNOSTIC: harvest starting, t=${realNow()}, document.visibilityState=${document.visibilityState}, ` +
+        `document.hidden=${document.hidden}`
+    );
+
+    // Genuine user input (wheel/touch) during the harvest is the signal to
+    // back off — per-instruction, abort and restore rather than fighting
+    // the operator for control of the scroll position. Setting
+    // scroller.scrollTop ourselves also fires a "scroll" event, which is
+    // why wheel/touchstart are watched instead of "scroll" — those only
+    // fire from real input, never from a script assigning scrollTop.
+    // Doesn't catch a direct scrollbar-thumb drag with no wheel/touch
+    // involved — a known gap, not a guessed-away one.
+    let userInterfered = false;
+    const markInterference = () => {
+      userInterfered = true;
+    };
+    scroller.addEventListener("wheel", markInterference, { passive: true });
+    scroller.addEventListener("touchstart", markInterference, { passive: true });
+
+    let reason = null;
+    let steps = 0;
+    let lastIndicesKey = null;
+
+    try {
+      const initialCollected = collectWindow();
+      const total = initialCollected && initialCollected.total ? initialCollected.total : null;
+      const initialTarget = estimateScrollTopForIndex(scroller, beforeIndex, total);
+      log(
+        `history: jumping toward estimate for beforeIndex=${beforeIndex}, total=${total}, ` +
+          `originalScrollTop=${originalScrollTop} -> target=${initialTarget}`
+      );
+
+      // Elapsed real time and visibilityState for the initial jump's wait,
+      // so a genuinely-backgrounded test run can confirm or kill the
+      // rAF/timer-throttling theory (see the comment above realNow, above).
+      const indicesBeforeJump = renderedIndices();
+      const scrollEventsBeforeJump = scrollEventCount;
+      const tBeforeJump = realNow();
+      const visBeforeJump = document.visibilityState;
+      scroller.scrollTop = initialTarget;
+      log(
+        `history: set scrollTop=${initialTarget}, readback=${scroller.scrollTop}, ` +
+          `visibilityState=${visBeforeJump}, t=${tBeforeJump}`
+      );
+      const jumpChanged = await waitForIndicesChange(indicesBeforeJump.join(","), HARVEST_STEP_SETTLE_TIMEOUT_MS);
+      const tAfterJump = realNow();
+      log(
+        `history: initial jump settle — changed=${jumpChanged}, elapsed=${tAfterJump - tBeforeJump}ms ` +
+          `(ceiling ${HARVEST_STEP_SETTLE_TIMEOUT_MS}ms), scrollEventsDuringWait=${scrollEventCount - scrollEventsBeforeJump}, ` +
+          `indicesBefore=[${indicesBeforeJump.join(",")}] indicesAfter=[${renderedIndices().join(",")}], ` +
+          `visibilityState ${visBeforeJump} -> ${document.visibilityState}`
+      );
+
+      while (reason === null) {
+        steps++;
+        if (requestConversationId !== state.conversationId) {
+          reason = "aborted-conversation-change";
+          break;
+        }
+        if (userInterfered) {
+          reason = "aborted-scroll";
+          break;
+        }
+        if (steps > MAX_HARVEST_STEPS) {
+          reason = "max-steps";
+          break;
+        }
+
+        const indices = renderedIndices();
+        const minIndex = indices.length ? indices[0] : null;
+        log(`history: step ${steps} — rendered [${indices.join(", ")}], scrollTop=${scroller.scrollTop}`);
+
+        // Send what's rendered right now regardless of what the stop-check
+        // below decides — every step's window is real data the bubble
+        // doesn't have yet, even the one that turns out to be the last.
+        sendTurnWindow();
+
+        // last-message-sentinel stays mounted even at the top (SPEC.md
+        // §4.1) — it's not part of renderedIndices()/collectWindow() (both
+        // read [data-testid="transcript-row"], not the sentinel), so it
+        // can't cause minIndex to look wrong here. Noted per the operator's
+        // instruction, not because anything below currently touches it.
+        if (minIndex === 0) {
+          reason = "reached-top";
+          break;
+        }
+        if (minIndex !== null && minIndex < beforeIndex) {
+          reason = "reached-target";
+          break;
+        }
+
+        const indicesKey = indices.join(",");
+        if (indicesKey === lastIndicesKey) {
+          reason = "no-progress";
+          break;
+        }
+        lastIndicesKey = indicesKey;
+
+        // Real DOM-signal wait (waitForIndicesChange), not a blind timeout —
+        // still logged with elapsed time + visibilityState so a
+        // genuinely-backgrounded test run can confirm or kill the
+        // rAF/timer-throttling theory; scrollEventCount is still tracked
+        // for the separate "does our own scrollTop assignment even fire a
+        // scroll event" question.
+        const scrollTopBeforeStep = scroller.scrollTop;
+        const scrollEventsBeforeStep = scrollEventCount;
+        const tBeforeStep = realNow();
+        const visBeforeStep = document.visibilityState;
+        if (scroller.scrollTop > 0) {
+          scroller.scrollTop = Math.max(0, scroller.scrollTop - scroller.clientHeight);
+          log(
+            `history: step ${steps} set scrollTop ${scrollTopBeforeStep} -> readback=${scroller.scrollTop}, ` +
+              `visibilityState=${visBeforeStep}, t=${tBeforeStep}`
+          );
+          const stepChanged = await waitForIndicesChange(indicesKey, HARVEST_STEP_SETTLE_TIMEOUT_MS);
+          const tAfterStep = realNow();
+          log(
+            `history: step ${steps} settle — changed=${stepChanged}, elapsed=${tAfterStep - tBeforeStep}ms ` +
+              `(ceiling ${HARVEST_STEP_SETTLE_TIMEOUT_MS}ms), scrollEventsDuringWait=${scrollEventCount - scrollEventsBeforeStep}, ` +
+              `indicesBefore=[${indices.join(",")}] indicesAfter=[${renderedIndices().join(",")}], ` +
+              `visibilityState ${visBeforeStep} -> ${document.visibilityState}`
+          );
+        } else {
+          log(`history: step ${steps} — scrollTop already 0, nothing further to scroll this step.`);
+        }
+      }
+    } finally {
+      scroller.removeEventListener("wheel", markInterference);
+      scroller.removeEventListener("touchstart", markInterference);
+      scroller.removeEventListener("scroll", onDiagnosticScroll);
+      document.removeEventListener("visibilitychange", onDiagnosticVisibility);
+      scroller.scrollTop = originalScrollTop;
+      log(
+        `history: finished — reason=${reason || "unknown"}, steps=${steps}, restored scrollTop=${originalScrollTop}, ` +
+          `t=${realNow()}, totalScrollEvents=${scrollEventCount}`
+      );
+      historyHarvestInFlight = false;
+      currentHarvestBeforeIndex = null;
+      send({ type: "history.done", conversationId: requestConversationId, beforeIndex, reason: reason || "unknown" });
     }
   }
 

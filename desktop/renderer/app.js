@@ -1,15 +1,14 @@
 // Vanilla JS bubble UI. No framework, no build step. Talks to the main
 // process only through window.bubble (contextBridge, see preload.js) — this
 // file never touches a WebSocket. See SPEC.md §4 and §4.1.
+//
+// renderMarkdown/escapeHtml (used below in paintTurn) come from
+// markdown.js, loaded as a plain global via its own <script> tag in
+// index.html, before this file — pulled out so it can be unit-tested from
+// plain Node (which has no `document` for this file to touch at load time).
+// See desktop/test-markdown.js.
 (() => {
   "use strict";
-
-  // Placeholder delimiter for markdown extraction (code blocks/spans).
-  // NUL can't occur in typed chat text, so it can't collide with real
-  // content — a padded-spaces scheme was tried first and rejected: it broke
-  // on real prose like "section B2", and a later trim() bug meant the
-  // block-level placeholder check never matched at all.
-  const PH = String.fromCharCode(0);
 
   // Checked once at load — this is a personal, single-session desktop app,
   // not a long-lived page where the OS setting might plausibly flip while
@@ -73,123 +72,6 @@
 
   const NEAR_BOTTOM_PX = 60;
   const NEAR_TOP_PX = 30;
-
-  // ---------- markdown (subset: headings, bold, italic, inline code, ----------
-  // ---------- fenced code blocks, unordered/ordered lists)             ----------
-
-  function escapeHtml(s) {
-    return s
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&#39;");
-  }
-
-  function renderInline(text) {
-    const codeSpans = [];
-    text = text.replace(/`([^`\n]+)`/g, (_, code) => {
-      codeSpans.push(code);
-      return PH + "K" + (codeSpans.length - 1) + PH;
-    });
-
-    text = text.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-    text = text.replace(/__([^_]+)__/g, "<strong>$1</strong>");
-    text = text.replace(/\*([^*]+)\*/g, "<em>$1</em>");
-    text = text.replace(/_([^_]+)_/g, "<em>$1</em>");
-
-    const codeRestoreRe = new RegExp(PH + "K(\\d+)" + PH, "g");
-    text = text.replace(codeRestoreRe, (_, i) => `<code>${codeSpans[Number(i)]}</code>`);
-    return text;
-  }
-
-  function renderMarkdown(rawText) {
-    const blocks = [];
-    let text = String(rawText || "").replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
-      blocks.push({ lang, code });
-      return PH + "B" + (blocks.length - 1) + PH;
-    });
-
-    text = escapeHtml(text);
-
-    const blockLineRe = new RegExp("^" + PH + "B\\d+" + PH + "$");
-    const lines = text.split("\n");
-    let html = "";
-    let i = 0;
-    while (i < lines.length) {
-      const line = lines[i];
-
-      if (blockLineRe.test(line.trim())) {
-        html += line.trim();
-        i++;
-        continue;
-      }
-
-      const heading = line.match(/^(#{1,6})\s+(.*)$/);
-      if (heading) {
-        const level = heading[1].length;
-        html += `<h${level}>${renderInline(heading[2])}</h${level}>`;
-        i++;
-        continue;
-      }
-
-      if (/^[-*]\s+/.test(line)) {
-        let items = "";
-        while (i < lines.length && /^[-*]\s+/.test(lines[i])) {
-          items += `<li>${renderInline(lines[i].replace(/^[-*]\s+/, ""))}</li>`;
-          i++;
-        }
-        html += `<ul>${items}</ul>`;
-        continue;
-      }
-
-      if (/^\d+\.\s+/.test(line)) {
-        let items = "";
-        while (i < lines.length && /^\d+\.\s+/.test(lines[i])) {
-          items += `<li>${renderInline(lines[i].replace(/^\d+\.\s+/, ""))}</li>`;
-          i++;
-        }
-        html += `<ol>${items}</ol>`;
-        continue;
-      }
-
-      if (line.trim() === "") {
-        i++;
-        continue;
-      }
-
-      const paraLines = [];
-      while (
-        i < lines.length &&
-        lines[i].trim() !== "" &&
-        !blockLineRe.test(lines[i].trim()) &&
-        !/^(#{1,6})\s+/.test(lines[i]) &&
-        !/^[-*]\s+/.test(lines[i]) &&
-        !/^\d+\.\s+/.test(lines[i])
-      ) {
-        paraLines.push(renderInline(lines[i]));
-        i++;
-      }
-      html += `<p>${paraLines.join("<br>")}</p>`;
-    }
-
-    const blockRestoreRe = new RegExp(PH + "B(\\d+)" + PH, "g");
-    html = html.replace(blockRestoreRe, (_, idxStr) => {
-      const b = blocks[Number(idxStr)];
-      const code = b.code.replace(/\n$/, "");
-      const escapedCode = escapeHtml(code);
-      const langLabel = b.lang ? escapeHtml(b.lang) : "";
-      return (
-        `<div class="code-block">` +
-        `<div class="code-block-header"><span class="code-lang">${langLabel}</span>` +
-        `<button class="copy-btn" type="button">Copy</button></div>` +
-        `<pre><code>${escapedCode}</code></pre>` +
-        `</div>`
-      );
-    });
-
-    return html;
-  }
 
   // ---------- rendering ----------
 
@@ -454,22 +336,58 @@
 
     updateHistoryBadge();
     updateEmptyState();
-    setLoadingOlder(false);
+    // Deliberately NOT setLoadingOlder(false) here. A single history.request
+    // harvest (SPEC.md §4.1) sends many turn.window batches before it's
+    // actually finished — clearing the loading state on the first one made
+    // the spinner vanish while older messages kept trickling in behind it.
+    // history.done (below) is the one signal that means "no more are
+    // coming," and is what turns it off.
   }
 
+  // Long enough to cover the extension's own worst case (MAX_HARVEST_STEPS
+  // steps in content.js, each waiting ~1.2s to settle) with real margin —
+  // this fires only if history.done is lost entirely (extension crash,
+  // dropped socket mid-harvest), not on any expected path. Without it, a
+  // lost history.done would leave historyRequestInFlight stuck true forever,
+  // permanently blocking every future scroll-triggered request.
+  const HISTORY_REQUEST_TIMEOUT_MS = 75000;
+  let historyRequestTimeoutTimer = null;
+
+  // The one place loading-older gets toggled off, from whichever caller —
+  // history.done, this timeout, or a conversation reset — so "not loading"
+  // always implies "no pending timeout," never a stray timer left ticking
+  // toward a stale request.
   function setLoadingOlder(loading) {
     state.historyRequestInFlight = loading;
     els.loadingOlder.hidden = !loading;
+    if (!loading && historyRequestTimeoutTimer) {
+      clearTimeout(historyRequestTimeoutTimer);
+      historyRequestTimeoutTimer = null;
+    }
   }
 
   function maybeRequestHistory() {
-    if (state.historyRequestInFlight) return;
+    // Logged (not silent) so a future test can confirm this guard is what's
+    // actually running, rather than assuming it from the absence of a
+    // second request — mergeTurnWindow's scroll-position preservation fires
+    // a native "scroll" event on every incoming batch, which re-enters this
+    // function far more often than the operator's own scrolling does.
+    if (state.historyRequestInFlight) {
+      console.log("[bubble-ui] maybeRequestHistory: a request is already in flight, ignoring re-trigger.");
+      return;
+    }
     if (!state.extensionConnected) return;
     if (!state.conversationId) return;
     if (state.minLoadedIndex === null || state.minLoadedIndex <= 0) return;
     if (els.messageList.scrollTop > NEAR_TOP_PX) return;
 
     setLoadingOlder(true);
+    historyRequestTimeoutTimer = setTimeout(() => {
+      historyRequestTimeoutTimer = null;
+      console.warn("[bubble-ui] history.request timed out with no history.done — re-enabling.");
+      setLoadingOlder(false);
+      showToast("Loading older messages took too long and was stopped. Try scrolling up again.");
+    }, HISTORY_REQUEST_TIMEOUT_MS);
     window.bubble.requestHistory(state.conversationId, state.minLoadedIndex);
   }
 
@@ -608,6 +526,18 @@
     "no-composer": "can't find the message box",
   };
 
+  // history.done's `reason` (SPEC.md §4.1) covers both ordinary completions
+  // and genuine problems. Only the latter get a toast — "reached-top" /
+  // "reached-target" / the two "aborted-*" reasons are expected outcomes
+  // (the history badge's updated count already shows the result), and
+  // surfacing them as if something went wrong would train the operator to
+  // ignore toasts that actually matter.
+  const HISTORY_DONE_TOAST_REASONS = {
+    "no-scroll-container": "Couldn't find the scrollable conversation area on the page.",
+    "no-progress": "Stopped loading older messages — the page didn't respond as expected. Try scrolling up again.",
+    "max-steps": "Stopped loading older messages after a while. Try scrolling up again to keep going.",
+  };
+
   function renderHealth() {
     if (!state.extensionConnected) {
       els.healthDot.className = "health-dot off";
@@ -671,11 +601,24 @@
     maybeRequestHistory();
   });
 
-  // ---------- message actions: copy / retry, and code-block copy buttons ----------
+  // ---------- message actions: copy / retry, code-block copy buttons, links ----------
   // One delegated listener (works for dynamically added turns and code
   // blocks alike, no per-element listeners to attach/leak).
 
   els.messageList.addEventListener("click", (e) => {
+    // A normal link click would navigate this Electron window itself away
+    // from the bubble UI (see main.js's will-navigate/setWindowOpenHandler
+    // for the belt-and-braces backstop if a click ever slipped past this).
+    // renderMarkdown already only ever emits href for http:/https:/mailto:
+    // (see markdown.js) — main.js validates again regardless before acting
+    // on it, since a URL crossing an IPC boundary is never trusted twice.
+    const link = e.target.closest(".turn-content a[href]");
+    if (link) {
+      e.preventDefault();
+      window.bubble.openExternalLink(link.getAttribute("href"));
+      return;
+    }
+
     const copyBtn = e.target.closest(".turn-copy-btn");
     if (copyBtn) {
       handleCopyClick(copyBtn);
@@ -1038,6 +981,14 @@
         );
         if (willReset) {
           resetConversationState(event.conversationId, event.title);
+        } else {
+          // Same conversation, a title-only follow-up — the extension sends
+          // the id immediately with title:null (SPEC.md's fix for
+          // document.title lagging behind a same-tab switch) and re-sends
+          // this once the real title is confirmed. Only the header text
+          // changes; nothing about the loaded turns does.
+          els.titleText.textContent =
+            event.title || (state.conversationId ? "Untitled conversation" : "New conversation");
         }
         break;
       }
@@ -1051,6 +1002,14 @@
         if (event.conversationId !== state.conversationId) break;
         mergeTurnWindow(event.turns, event.total);
         break;
+
+      case "history.done": {
+        if (event.conversationId !== state.conversationId) break;
+        setLoadingOlder(false);
+        const toastMessage = HISTORY_DONE_TOAST_REASONS[event.reason];
+        if (toastMessage) showToast(toastMessage);
+        break;
+      }
 
       case "turn.start":
         handleTurnStart(event);

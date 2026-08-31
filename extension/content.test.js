@@ -2,7 +2,8 @@
 // content.js. No framework, no dependency. Run with:
 //   node extension/content.test.js
 const assert = require("node:assert");
-const { cleanText, stripAccessibilityDuplicate, stripTitleSuffix, insertCodeFences } = require("./content.js");
+const { cleanText, stripAccessibilityDuplicate, stripTitleSuffix, insertCodeFences, domToMarkdown } = require("./content.js");
+const { el, text } = require("./test-fakedom.js");
 
 // The real fix for the accessibility preview/duplicate is DOM-level now:
 // extractRowText hides h2.sr-only before ever reading innerText, so in
@@ -120,6 +121,194 @@ const { cleanText, stripAccessibilityDuplicate, stripTitleSuffix, insertCodeFenc
   const result = insertCodeFences(raw, ["totally unrelated code"]);
   assert.strictEqual(result, raw, "an unlocatable code block should be left alone, not guessed at");
   console.log("OK: unlocatable code block skipped without corrupting text");
+}
+
+// ---------------------------------------------------------------------
+// domToMarkdown — real DOM fragments in, markdown text out.
+//
+// claude.ai has already rendered Claude's markdown into real HTML by the
+// time this extension reads a row: a real <table>, a real <ul>, a real
+// <a href>. innerText on that gives back visible text with the syntax
+// gone — no pipes, no dashes, no [text](url) — since that syntax only
+// ever existed in the raw output, before the page rendered it. So these
+// tests build actual DOM fragments (see test-fakedom.js) and check what
+// domToMarkdown reconstructs from their STRUCTURE, not from hand-written
+// markdown strings — a test built from a markdown string would pass
+// whether or not the DOM-reading code underneath it actually worked, and
+// that gap is exactly what let this feature ship completely broken while
+// a differently-scoped test suite (desktop/test-markdown.js, which tests
+// the bubble's markdown *renderer*, an unrelated file in an unrelated
+// process) stayed green throughout.
+// ---------------------------------------------------------------------
+
+// Headings h1-h6.
+{
+  const row = el("div", [el("h1", ["Title"]), el("h3", ["Sub"]), el("h6", ["Tiny"])]);
+  assert.strictEqual(domToMarkdown(row), "# Title\n\n### Sub\n\n###### Tiny");
+  console.log("OK: <h1>-<h6> -> # through ######");
+}
+
+// Unordered list.
+{
+  const row = el("div", [el("ul", [el("li", ["a"]), el("li", ["b"])])]);
+  assert.strictEqual(domToMarkdown(row), "- a\n- b");
+  console.log("OK: <ul><li> -> - item");
+}
+
+// Ordered list, default numbering and an explicit start attribute (a
+// real <ol start="N"> is what claude.ai would render for a markdown list
+// that didn't start at 1).
+{
+  const row = el("div", [el("ol", [el("li", ["first"]), el("li", ["second"])])]);
+  assert.strictEqual(domToMarkdown(row), "1. first\n2. second");
+  console.log("OK: <ol><li> -> numbered items");
+}
+{
+  const row = el("div", [el("ol", { start: "5" }, [el("li", ["five"]), el("li", ["six"])])]);
+  assert.strictEqual(domToMarkdown(row), "5. five\n6. six");
+  console.log("OK: <ol start=\"5\"> -> numbering continues from the real start attribute");
+}
+
+// Nested list — must indent deeper than the parent item, since that's the
+// only signal markdown.js's own parser uses to recognise nesting.
+{
+  const row = el("div", [
+    el("ul", [el("li", [text("top"), el("ul", [el("li", ["nested"])])]), el("li", ["top2"])]),
+  ]);
+  assert.strictEqual(domToMarkdown(row), "- top\n  - nested\n- top2");
+  console.log("OK: nested <ul> indents deeper than its parent <li>");
+}
+
+// Table — pipe table with a header separator row.
+{
+  const row = el("div", [
+    el("table", [
+      el("tr", [el("th", ["A"]), el("th", ["B"])]),
+      el("tr", [el("td", ["1"]), el("td", ["2"])]),
+    ]),
+  ]);
+  assert.strictEqual(domToMarkdown(row), "| A | B |\n| --- | --- |\n| 1 | 2 |");
+  console.log("OK: <table> -> pipe table with header separator row");
+}
+
+// Blockquote.
+{
+  const row = el("div", [el("blockquote", [el("p", ["quoted text"])])]);
+  assert.strictEqual(domToMarkdown(row), "> quoted text");
+  console.log("OK: <blockquote> -> > quoted");
+}
+
+// Horizontal rule.
+{
+  const row = el("div", [el("p", ["above"]), el("hr"), el("p", ["below"])]);
+  assert.strictEqual(domToMarkdown(row), "above\n\n---\n\nbelow");
+  console.log("OK: <hr> -> ---");
+}
+
+// Link.
+{
+  const row = el("div", [el("p", [text("see "), el("a", { href: "https://example.com" }, ["docs"])])]);
+  assert.strictEqual(domToMarkdown(row), "see [docs](https://example.com)");
+  console.log("OK: <a href> -> [text](url)");
+}
+
+// Bold, italic, strikethrough, inline code — both tag spellings of each.
+{
+  const row = el("div", [
+    el("p", [
+      el("strong", ["bold"]),
+      text(" "),
+      el("b", ["bold2"]),
+      text(" "),
+      el("em", ["italic"]),
+      text(" "),
+      el("i", ["italic2"]),
+      text(" "),
+      el("del", ["strike"]),
+      text(" "),
+      el("s", ["strike2"]),
+      text(" "),
+      el("code", ["inline"]),
+    ]),
+  ]);
+  assert.strictEqual(
+    domToMarkdown(row),
+    "**bold** **bold2** *italic* *italic2* ~~strike~~ ~~strike2~~ `inline`"
+  );
+  console.log("OK: <strong>/<b>, <em>/<i>, <del>/<s>, <code> -> markdown");
+}
+
+// <pre> — the existing, confirmed-working fence rebuild (insertCodeFences/
+// rebuildCodeFences, untouched by this change) still runs correctly when
+// fed by the new DOM walk instead of row.innerText. Expected value matches
+// the already-established behaviour above: a recognised language label
+// line is consumed into the fence, not left duplicated beside it.
+{
+  const row = el("div", [el("p", ["python"]), el("pre", ["def f():\n    return 1"])]);
+  assert.strictEqual(domToMarkdown(row), "```python\ndef f():\n    return 1\n```");
+  console.log("OK: <pre> -> fenced code block via the existing, unchanged rebuildCodeFences");
+}
+
+// Exclusions must still work: h2.sr-only, an action-bar button, and the
+// relative-timestamp element all contribute nothing to the output.
+{
+  const row = el("div", [
+    el("h2", { class: "sr-only" }, ["You said: preview text"]),
+    el("p", [text("Real message content")]),
+    el("button", { "data-testid": "action-bar-copy" }, ["Copy"]),
+    el("time", { "data-cds": "RelativeTime" }, ["6 days ago"]),
+  ]);
+  assert.strictEqual(domToMarkdown(row), "Real message content");
+  console.log("OK: h2.sr-only, action-bar buttons, and the relative-timestamp element are excluded");
+}
+
+// Icon glyphs (Anthropicons, private-use-font spans) are excluded even
+// when nested inside inline formatting, not just at the top level.
+{
+  const row = el("div", [
+    el("p", [el("strong", [el("span", { "data-cds": "Icon" }, [""]), text("bold text")])]),
+  ]);
+  assert.strictEqual(domToMarkdown(row), "**bold text**");
+  console.log("OK: icon-glyph span excluded even nested inside inline formatting");
+}
+
+// tool-status-pill and img become their fixed placeholders, each its own
+// block when they sit between paragraphs.
+{
+  const row = el("div", [
+    el("p", [text("Before")]),
+    el("div", { "data-testid": "tool-status-pill" }, ["Connecting to search..."]),
+    el("p", [text("After")]),
+  ]);
+  assert.strictEqual(domToMarkdown(row), "Before\n\n[tool]\n\nAfter");
+  console.log("OK: tool-status-pill -> [tool] placeholder");
+}
+{
+  const row = el("div", [el("p", [text("See:")]), el("img", { src: "photo.png" })]);
+  assert.strictEqual(domToMarkdown(row), "See:\n\n[image]");
+  console.log("OK: img -> [image] placeholder");
+}
+
+// Realistic combined message: heading, a paragraph with bold and a link,
+// and a list — the shape an actual reply looks like, not an isolated
+// single-tag fixture.
+{
+  const row = el("div", [
+    el("h2", ["Summary"]),
+    el("p", [
+      text("Here is "),
+      el("strong", ["important"]),
+      text(" info and a "),
+      el("a", { href: "https://x.com" }, ["link"]),
+      text("."),
+    ]),
+    el("ul", [el("li", ["first point"]), el("li", ["second point"])]),
+  ]);
+  assert.strictEqual(
+    domToMarkdown(row),
+    "## Summary\n\nHere is **important** info and a [link](https://x.com).\n\n- first point\n- second point"
+  );
+  console.log("OK: realistic combined message (heading + paragraph + bold + link + list)");
 }
 
 console.log("\nAll content.js text-extraction tests passed.");

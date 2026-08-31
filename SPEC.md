@@ -157,10 +157,25 @@ WebSocket; see the note below.
 navigates to a different conversation. `conversationId` may be `null` on
 `claude.ai/new`.
 ```json
-{ "type": "conversation", "conversationId": "<id or null>", "title": "..." }
+{ "type": "conversation", "conversationId": "<id or null>", "title": "<string or null>" }
 ```
 The server records this, forwards it to the bubble, and sends the bubble the
 stored history for that conversation.
+
+**`title` may be `null`, and often is on the first message after a switch.**
+Confirmed 2026-08-29: `document.title` doesn't update in the same instant as
+the URL when switching between existing conversations (no page reload) — how
+long the real title takes to catch up isn't guaranteed. Reading it at the
+exact moment the id changes reliably captured the *previous* conversation's
+title, sent alongside the new id — the bubble's header was always one switch
+behind. The extension now sends the new id immediately with `title: null`
+(never a value it knows is unreliable), then re-sends `conversation` with the
+same id once `document.title` actually diverges from what it read at the
+switch — or after a 5-second ceiling, if it never does. Turn capture
+(`attachRowObserver`/`sendTurnWindow`) is not delayed waiting for this; only
+the header text is. The bubble treats a same-id `conversation` message as a
+title-only update — repainting just the header, not resetting loaded turns —
+rather than only reacting to an id change.
 
 **`turn.window`** — extension only. A **partial** view of the transcript: the
 rows currently rendered, each carrying its true `index` from the page. Sent on
@@ -180,8 +195,65 @@ messages the bubble does not yet have.
 ```json
 { "type": "history.request", "conversationId": "<id>", "beforeIndex": 136 }
 ```
-The extension harvests the next batch below `beforeIndex` and replies with one or
-more `turn.window` messages.
+The extension steps the scroll container found by §4.1's scroll-container
+detection upward, sending a `turn.window` after every step, until either a
+rendered index below `beforeIndex` appears or index 0 is rendered — then
+always restores the original scroll position and sends `history.done`
+(below), regardless of how the loop ended.
+
+**Only one harvest runs at a time.** A `history.request` that arrives while
+one is already in progress is refused with `error` (`HISTORY_BUSY`), not
+queued — confirmed 2026-08-29: two harvests manipulating the same scroll
+container concurrently means neither's captured original scroll position is
+meaningful, and one can restore `scrollTop` out from under the other mid-jump
+(this is what made a harvest look stalled until a manual scroll intervened —
+see `no-progress`/`aborted-scroll` below, neither of which fired because the
+real problem wasn't the harvest itself). Refusing rather than queueing is
+deliberate: the bubble is expected not to send a second request before the
+first's `history.done` arrives (see the render side, below), so a genuine
+overlap means something upstream is wrong, and a queued run would likely be
+serving a `beforeIndex` the bubble has already moved past by the time it's
+served.
+
+On the bubble side, the scroll-triggered request (`maybeRequestHistory`)
+holds a single in-flight flag that is set on send and cleared only by this
+`history.request`'s own `history.done` (or a timeout — see §8) — never by an
+intermediate `turn.window` batch, since one harvest produces many of those
+before it's actually finished.
+
+The first move is a jump toward a *proportional estimate* of where
+`beforeIndex` lives (`index / (total - 1)` of the scrollable range — the same
+math `retry` uses to locate a single row), not a plain step from wherever the
+live view currently sits. Skipping straight to the neighbourhood of
+`beforeIndex` avoids re-stepping through, and re-sending, every index between
+the live tail and `beforeIndex` that the bubble already has.
+
+Two more stop conditions, both defensive:
+- **A step renders the same set of indices as the previous one.** The
+  virtualizer isn't responding to further scrolling — stop rather than loop
+  forever.
+- **A hard cap of 40 steps.** Reached only if the estimate was badly off or
+  the no-progress check somehow didn't catch a stall; real harvests are
+  expected to finish in a handful of steps.
+
+The harvest also aborts if genuine user input (a `wheel` or `touchstart`
+event on the scroll container — never fired by the script's own
+`scrollTop` assignments) is seen mid-harvest, or if the conversation changes
+underneath it. Both are reported the same way as reaching the top or the
+target: restore scroll position, send `history.done`.
+
+**`history.done`** — extension only, sent once per `history.request` after
+the scroll position has been restored.
+```json
+{ "type": "history.done", "conversationId": "<id>", "beforeIndex": 136,
+  "reason": "reached-target" | "reached-top" | "no-progress" | "max-steps" |
+            "aborted-scroll" | "aborted-conversation-change" |
+            "no-scroll-container" }
+```
+This is the one signal the bubble waits for to know a harvest is actually
+over — a single `history.request` produces *many* `turn.window` messages
+before it's done, so clearing a "loading older" indicator on the first one
+to arrive would hide it while most of the harvest was still running.
 
 **`prompt`** — bubble to extension.
 ```json
@@ -233,9 +305,8 @@ scrolled," not "new" — so the extension separately watches the retried row's
 wrong and claude.ai appends a new row instead, nothing needs to handle it
 specially: a new index is picked up by the normal `turn.start` path exactly
 like any other new message. If indices shift instead, nothing here detects
-that — it would need a full re-harvest to converge, and the general
-multi-step `history.request` harvest itself is not yet implemented (only the
-single-row locate `retry` needs).
+that — it would need a full re-harvest (`history.request`, above) to
+converge.
 
 **All four messages below carry `conversationId`** (added 2026-08-29). Editing
 this in: the extension always knows which conversation a turn belongs to, so
@@ -270,10 +341,29 @@ rather than only once a later `turn.window`/harvest happens to cover it —
 `retry` needs a row's index to act on it, and the message just sent or the
 reply just received is the most likely thing to want to retry.
 
+**`turn.delta`, `turn.replace`, and `turn.end` also carry `index`** (added
+2026-08-30, the same row index `turn.start` sends). Before this, only
+`turn.start` carried it, so a `turn.delta`/`turn.replace`/`turn.end` for a
+turnId whose `turn.start` the server never saw — concretely: the desktop app
+is quit and relaunched while a reply is still generating, so the new
+process's `pendingTurns` starts empty with no entry for that turn — had no
+way to be persisted. The server would still forward the deltas to the
+bubble, rendering a live message, but then drop `turn.end` for lack of
+anywhere to write it: the reply was lost permanently, and the bubble was
+left showing it as stuck mid-stream forever, with no later `turn.window`
+guaranteed to ever cover that exact row again. With `index` on all four turn
+messages, the server can build a `pendingTurns` entry from whichever of them
+arrives first — see `ensurePendingTurn` in `server.js`, used by the
+`turn.delta`/`turn.replace`/`turn.end` handlers below. This reuses
+`msg.index`, the extension's own authoritative reading of the row — it is
+not the `convo.total` guess `turn.end` removed on 2026-08-29 (see that
+paragraph above), which invented a position from whatever conversation
+happened to be current rather than reading it from the row itself.
+
 **`turn.delta`** — extension only. Text appended to an in-progress turn.
 ```json
 { "type": "turn.delta", "turnId": "<id>", "conversationId": "<id or null>",
-  "text": "chunk" }
+  "index": 137, "text": "chunk" }
 ```
 
 **`turn.replace`** — extension only. The full current text for a turnId,
@@ -292,14 +382,14 @@ turnId they already know — the same rule `turn.delta`/`turn.end` already
 follow.
 ```json
 { "type": "turn.replace", "turnId": "<id>", "conversationId": "<id or null>",
-  "text": "current full text" }
+  "index": 137, "text": "current full text" }
 ```
 
 **`turn.end`** — extension only. `text` is the full final text and is
 authoritative; it replaces whatever the deltas produced.
 ```json
 { "type": "turn.end", "turnId": "<id>", "conversationId": "<id or null>",
-  "text": "complete message text" }
+  "index": 137, "text": "complete message text" }
 ```
 
 **`status`** — extension only, every 20 seconds.
@@ -330,12 +420,13 @@ disconnects.
 **`error`** — sent by the server on a rejected connection (`BAD_TOKEN` |
 `ROLE_TAKEN` | `MALFORMED`), and also relayed as-is from the extension when it
 can't carry out something the bubble asked for — `RETRY_FAILED` (see `retry`
-above), or `PROMPT_BUSY` / `PROMPT_FAILED` (see `prompt` above). The bubble
+above), `PROMPT_BUSY` / `PROMPT_FAILED` (see `prompt` above), or
+`HISTORY_FAILED` / `HISTORY_BUSY` (see `history.request` above). The bubble
 shows it rather than failing silently.
 ```json
 { "type": "error",
   "code": "BAD_TOKEN" | "ROLE_TAKEN" | "MALFORMED" | "RETRY_FAILED" |
-          "PROMPT_BUSY" | "PROMPT_FAILED",
+          "PROMPT_BUSY" | "PROMPT_FAILED" | "HISTORY_FAILED" | "HISTORY_BUSY",
   "message": "..." }
 ```
 
@@ -519,6 +610,7 @@ None of these fall out of generic HTML-to-Markdown conversion.
 | Virtualized transcript corrupts history | **Resolved by design 2026-08-27** | Confirmed: 6 of 142 rows in DOM. Merge by `index`, ignore removals, harvest on demand. See §4.1. |
 | Image exceeds max message size | Attachment silently rejected | A phone photo of 4MB becomes ~5.3MB base64, over the 5MB cap. Send images as binary WebSocket frames, or downscale in the bubble before encoding. Decide in Phase 3. |
 | macOS Local Network privacy prompt | Possible silent failure | Distinct from Chrome's Local Network Access. Apple's prompt targets LAN and Bonjour discovery; pure loopback inside one process is unlikely to trigger it, and the app is both server and only local client. Untested. If a prompt appears during Phase 1, allow it and record the result here. |
+| A `history.request`'s `history.done` never arrives (extension crash, dropped socket mid-harvest) | The bubble's single in-flight flag would stay stuck true forever, permanently blocking every future scroll-triggered history request | Bubble-side 75-second timeout clears the flag and shows a toast if `history.done` hasn't arrived by then — long enough to cover the extension's own worst case (a 40-step harvest, each step waiting ~1.2s) with real margin, so it fires only when the signal is genuinely lost, not on any expected path. |
 
 ## 9. What is deliberately absent
 

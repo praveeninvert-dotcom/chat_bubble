@@ -93,6 +93,43 @@ function createBubbleServer({ userDataDir, getToken, onEvent, port = PORT }) {
     persist();
   }
 
+  // Returns the pendingTurns entry for msg.turnId, creating one on the fly
+  // from msg.index if it doesn't exist (SPEC.md §4, 2026-08-30). Without
+  // this, a turn.delta/turn.replace/turn.end for a turnId whose turn.start
+  // this server process never saw — the concrete case is the desktop app
+  // being quit and relaunched while a reply was still generating, so the
+  // new process's pendingTurns starts empty — had no way to be persisted:
+  // turn.end would find nothing in pendingTurns and drop silently (see case
+  // "turn.end" below), permanently losing that reply even though the
+  // extension sent its full final text. turn.delta/turn.replace/turn.end
+  // now all carry the same row index turn.start already did, so any of them
+  // can recover the mapping, not just turn.start specifically. Only ever
+  // creates an assistant entry — turn.delta/turn.replace/turn.end are only
+  // ever sent for assistant rows (content.js only attaches watchStreaming,
+  // and therefore only ever emits these, for role: "assistant"; a user
+  // row's turn always finishes via turn.start's own immediate
+  // finishLiveTurn call instead).
+  function ensurePendingTurn(msg) {
+    let pending = pendingTurns.get(msg.turnId);
+    if (pending) return pending;
+    if (typeof msg.index !== "number") return null;
+    console.log(
+      `[bubble-server] recovered pendingTurns entry for turnId=${msg.turnId} from its own index=${msg.index} ` +
+        `— no turn.start was ever seen for it (likely a desktop app restart mid-reply).`
+    );
+    pending = {
+      role: "assistant",
+      origin: "native",
+      promptId: null,
+      ts: Date.now(),
+      buffer: "",
+      index: msg.index,
+      flushTimer: null,
+    };
+    pendingTurns.set(msg.turnId, pending);
+    return pending;
+  }
+
   function sendHistory(conversationId) {
     const convo = conversationId ? store.conversations[conversationId] : null;
     emit({
@@ -353,7 +390,7 @@ function createBubbleServer({ userDataDir, getToken, onEvent, port = PORT }) {
           );
           return;
         }
-        const pending = pendingTurns.get(msg.turnId);
+        const pending = ensurePendingTurn(msg);
         if (pending) {
           pending.buffer += msg.text || "";
           if (!pending.flushTimer) {
@@ -382,7 +419,7 @@ function createBubbleServer({ userDataDir, getToken, onEvent, port = PORT }) {
           );
           return;
         }
-        const pending = pendingTurns.get(msg.turnId);
+        const pending = ensurePendingTurn(msg);
         if (pending) {
           pending.buffer = msg.text || "";
           if (!pending.flushTimer) {
@@ -409,20 +446,32 @@ function createBubbleServer({ userDataDir, getToken, onEvent, port = PORT }) {
           pendingTurns.delete(msg.turnId);
           return;
         }
-        const pending = pendingTurns.get(msg.turnId);
-        // No fallback index. This used to be
-        // `pending && pending.index != null ? pending.index : convo.total || 0`
-        // — guessing convo.total when the mapping was gone. That guess is
-        // exactly what wrote one conversation's replies into a different
-        // conversation's history (2026-08-29): pendingTurns had been cleared
-        // by a benign reconnect (see case "conversation" and the socket
-        // "close" handler above) or by the operator genuinely switching
-        // conversations mid-reply, and convo.total pointed at whatever
-        // conversation happened to be current when this orphaned turn.end
-        // finally arrived — not the conversation the reply actually
-        // belonged to. Dropping instead is safe: the next turn.window
-        // resync fills the right index in correctly, straight from the
-        // page, once the row settles (SPEC.md §4.1).
+        // ensurePendingTurn (SPEC.md §4, 2026-08-30) recovers a missing
+        // entry from msg.index — the row's real page index, the same
+        // trustworthy value turn.start always used — when this turnId's
+        // turn.start was never seen (e.g. the desktop app restarted
+        // mid-reply). This is NOT the convo.total guess removed below: that
+        // guess invented a position from whatever conversation happened to
+        // be current, which is exactly what corrupted history on
+        // 2026-08-29; msg.index is the extension's own authoritative
+        // reading of this specific row, unrelated to convo.total.
+        const pending = ensurePendingTurn(msg);
+        // Still no fallback index beyond what ensurePendingTurn found. This
+        // used to be `pending && pending.index != null ? pending.index :
+        // convo.total || 0` — guessing convo.total when the mapping was
+        // gone. That guess is exactly what wrote one conversation's replies
+        // into a different conversation's history (2026-08-29): pendingTurns
+        // had been cleared by a benign reconnect (see case "conversation"
+        // and the socket "close" handler above) or by the operator genuinely
+        // switching conversations mid-reply, and convo.total pointed at
+        // whatever conversation happened to be current when this orphaned
+        // turn.end finally arrived — not the conversation the reply
+        // actually belonged to. Dropping instead is safe: the next
+        // turn.window resync fills the right index in correctly, straight
+        // from the page, once the row settles (SPEC.md §4.1). A turn.end
+        // that still has no usable index at all (msg.index also missing —
+        // an older extension build, or a genuinely malformed message) has no
+        // way to be recovered and is dropped the same as before.
         if (!pending || pending.index == null) {
           console.log(
             `[bubble-server] dropped turn.end: no usable index for turnId=${msg.turnId} ` +
@@ -464,6 +513,21 @@ function createBubbleServer({ userDataDir, getToken, onEvent, port = PORT }) {
       // bubble can show it instead of the failure being silent.
       case "error": {
         emit({ type: "error", code: msg.code || "UNKNOWN", message: msg.message || "" });
+        break;
+      }
+
+      // Marks a history.request's harvest as finished (SPEC.md §4.1). A
+      // harvest sends many turn.window batches before it's actually done —
+      // this is the one signal the bubble waits for to know no more are
+      // coming, rather than guessing from the arrival of any single batch.
+      // No server-side state to track beyond forwarding it, same as retry.
+      case "history.done": {
+        emit({
+          type: "history.done",
+          conversationId: msg.conversationId,
+          beforeIndex: msg.beforeIndex,
+          reason: msg.reason || "unknown",
+        });
         break;
       }
 

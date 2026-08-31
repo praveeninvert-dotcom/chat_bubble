@@ -505,6 +505,99 @@ body.dragging .panel {
   font-style: italic;
 }
 
+.turn-content del {
+  opacity: 0.7;
+}
+
+.turn-content hr {
+  border: none;
+  border-top: 1px solid rgba(255, 255, 255, 0.14);
+  margin: 10px 0;
+}
+
+.turn-content blockquote {
+  margin: 6px 0;
+  padding: 2px 10px;
+  border-left: 2px solid rgba(255, 255, 255, 0.18);
+  color: #b8b8b8;
+}
+
+.turn-content blockquote p {
+  margin: 0 0 4px;
+}
+
+.turn-content blockquote p:last-child {
+  margin-bottom: 0;
+}
+
+/* Muted on purpose — a bright blue link would stand out against this
+   panel's deliberately quiet grayscale palette (see .turn-user/.turn-
+   assistant .turn-content above) more than a message link should. */
+.turn-content a {
+  color: #a7bdd9;
+  text-decoration: underline;
+  text-decoration-color: rgba(167, 189, 217, 0.45);
+  cursor: pointer;
+}
+
+.turn-content a:hover {
+  color: #c3d3e8;
+}
+
+/* Wraps every table so it can scroll horizontally without the message
+   bubble itself growing wider than the panel — see .turn-content table's
+   white-space: nowrap below, which is what makes a wide table actually
+   overflow this instead of just wrapping cell text. */
+.table-wrap {
+  overflow-x: auto;
+  margin: 6px 0;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.turn-content table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 12px;
+}
+
+.turn-content th,
+.turn-content td {
+  padding: 4px 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.turn-content th {
+  background: rgba(255, 255, 255, 0.05);
+  font-weight: 700;
+  color: #ddd;
+}
+
+.turn-content tr:last-child td {
+  border-bottom: none;
+}
+
+/* Same thin dark scrollbar as the message list/composer/code blocks (see
+   below and above) — only the horizontal axis is ever used here. */
+.table-wrap::-webkit-scrollbar {
+  height: 6px;
+}
+
+.table-wrap::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.table-wrap::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 3px;
+}
+
+.table-wrap::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.25);
+}
+
 .code-block {
   margin: 6px 0;
   border-radius: 8px;

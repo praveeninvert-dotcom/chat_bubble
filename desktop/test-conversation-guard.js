@@ -1,8 +1,17 @@
-// Deliberately exercises the turn.end conversationId guard in server.js that
-// replaced the convo.total guess-fallback removed 2026-08-29 (SPEC.md §4).
-// That guess is what silently wrote one conversation's replies into a
-// different conversation's stored history — this test reproduces the exact
-// shape of that bug on purpose and confirms the fix drops the turn instead.
+// Deliberately exercises two related server.js guards around pendingTurns:
+//
+// Scenarios 1-2: the turn.end conversationId guard that replaced the
+// convo.total guess-fallback removed 2026-08-29 (SPEC.md §4). That guess is
+// what silently wrote one conversation's replies into a different
+// conversation's stored history — these reproduce the exact shape of that
+// bug on purpose and confirm the fix drops the turn instead.
+//
+// Scenario 3: ensurePendingTurn, added 2026-08-30 (SPEC.md §4) alongside
+// turn.delta/turn.replace/turn.end all carrying `index`. A turn.end for a
+// turnId whose turn.start this server never saw (e.g. the desktop app was
+// quit and relaunched mid-reply) used to be dropped unconditionally, losing
+// the reply permanently — this confirms it now persists instead, using the
+// index carried on turn.end itself.
 //
 // Runs its OWN throwaway server on a separate port with a temporary
 // userData directory — it never touches the real desktop app, the real
@@ -20,6 +29,7 @@ const TEST_PORT = 18787; // unrelated to the real app's 8787
 const TOKEN = "test-guard-token";
 const CONVO_A = "TEST-GUARD-CONVERSATION-A";
 const CONVO_B = "TEST-GUARD-CONVERSATION-B";
+const CONVO_C = "TEST-GUARD-CONVERSATION-C";
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "bubble-guard-test-"));
 
@@ -88,13 +98,35 @@ async function run() {
   });
   await sleep(200);
 
-  // --- Scenario 2: turn.end with no matching turn.start at all (the other
-  // guard clause — no usable index, regardless of conversationId).
+  // --- Scenario 2: turn.end with no matching turn.start at all, and no
+  // index either (the other guard clause — no usable index, regardless of
+  // conversationId). Distinct from Scenario 3 below: this one has nothing
+  // ensurePendingTurn could recover from, so it should still drop.
   send({
     type: "turn.end",
     turnId: "guard-turn-2",
     conversationId: CONVO_B,
     text: "SCENARIO 2 LEAK — should never be persisted",
+  });
+  await sleep(200);
+
+  // --- Scenario 3: turn.end with an index but genuinely no prior
+  // turn.start — the concrete case being a desktop app restart mid-reply,
+  // so the new process's pendingTurns never had an entry for this turn at
+  // all (SPEC.md §4, 2026-08-30). Unlike Scenario 2, this SHOULD persist:
+  // ensurePendingTurn recovers a pendingTurns entry from msg.index itself.
+  // Run on its own conversation (C) so it can't be confused with A/B's
+  // "should stay empty" assertions above.
+  send({ type: "conversation", conversationId: CONVO_C, title: "Guard test C" });
+  await sleep(100);
+  const turnId3 = "guard-turn-3";
+  const scenario3Index = 5;
+  send({
+    type: "turn.end",
+    turnId: turnId3,
+    conversationId: CONVO_C,
+    index: scenario3Index,
+    text: "SCENARIO 3 — should persist via recovered index",
   });
   await sleep(200);
 
@@ -104,10 +136,16 @@ async function run() {
   const data = fs.existsSync(storeFile) ? JSON.parse(fs.readFileSync(storeFile, "utf8")) : { conversations: {} };
   const convoA = data.conversations[CONVO_A];
   const convoB = data.conversations[CONVO_B];
+  const convoC = data.conversations[CONVO_C];
   const aHasTurns = !!(convoA && convoA.turns && Object.keys(convoA.turns).length > 0);
   const bHasTurns = !!(convoB && convoB.turns && Object.keys(convoB.turns).length > 0);
   const droppedMismatch = serverLogs.some((l) => l.includes("dropped turn.end") && l.includes(CONVO_A));
   const droppedOrphan = serverLogs.some((l) => l.includes("dropped turn.end") && l.includes("no pendingTurns entry"));
+  const scenario3Turn = convoC && convoC.turns && convoC.turns[String(scenario3Index)];
+  const scenario3Persisted = !!(scenario3Turn && scenario3Turn.text === "SCENARIO 3 — should persist via recovered index");
+  const scenario3Recovered = serverLogs.some(
+    (l) => l.includes("recovered pendingTurns entry") && l.includes(turnId3) && l.includes(`index=${scenario3Index}`)
+  );
 
   originalLog("");
   originalLog("=== Scenario 1: conversationId mismatch (started under A, finished after switching to B) ===");
@@ -115,16 +153,22 @@ async function run() {
   originalLog(droppedMismatch ? "PASS — server logged the drop." : "FAIL — no drop was logged.");
 
   originalLog("");
-  originalLog("=== Scenario 2: turn.end with no prior turn.start ===");
+  originalLog("=== Scenario 2: turn.end with no prior turn.start and no index ===");
   originalLog(bHasTurns ? "FAIL — turn was written to disk." : "PASS — dropped, nothing written.");
   originalLog(droppedOrphan ? "PASS — server logged the drop." : "FAIL — no drop was logged.");
 
-  const failed = aHasTurns || bHasTurns || !droppedMismatch || !droppedOrphan;
+  originalLog("");
+  originalLog("=== Scenario 3: turn.end with an index but no prior turn.start (app-restart-mid-reply) ===");
+  originalLog(scenario3Persisted ? "PASS — persisted at the recovered index." : "FAIL — turn was NOT persisted.");
+  originalLog(scenario3Recovered ? "PASS — server logged the recovery." : "FAIL — no recovery was logged.");
+
+  const failed =
+    aHasTurns || bHasTurns || !droppedMismatch || !droppedOrphan || !scenario3Persisted || !scenario3Recovered;
   originalLog("");
   originalLog(
     failed
-      ? "RESULT: FAIL — the guard did not behave as expected. Investigate before trusting it."
-      : "RESULT: PASS — both mismatched turns were dropped, not misfiled."
+      ? "RESULT: FAIL — the guards did not behave as expected. Investigate before trusting them."
+      : "RESULT: PASS — both mismatched turns were dropped, and the restart-mid-reply turn was recovered and persisted."
   );
   cleanup(failed ? 1 : 0);
 }
